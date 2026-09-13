@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="row g-4">
+  <div class="col-lg-7">
+    <div class="card">
+      <div class="card-header">Stacks in the cluster</div>
+      <table class="table table-sm mb-0 align-middle">
+        <thead>
+          <tr>
+            <th>Namespace</th>
+            <th>Component</th><th>Ready</th><th>Min</th><th>Max</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for s in stacks %}
+          {% for deployment, container, label, dmin, dmax in components %}
+          {% set c = s.get(deployment) %}
+          <tr>
+            {% if loop.first %}
+              <td class="font-monospace" rowspan="{{ components|length }}">{{ s.namespace }}</td>
+            {% endif %}
+            <td>{{ label }}</td>
+            <td>{{ c.ready if c else '-' }}</td>
+            <td class="font-monospace">{{ c.min if c else '-' }}</td>
+            <td class="font-monospace">{{ c.max if c else '-' }}</td>
+            {% if loop.first %}
+              <td class="text-end" rowspan="{{ components|length }}">
+                <button class="btn btn-sm btn-outline-secondary mb-1 js-fill"
+                        data-stack='{{ s|tojson }}'>Edit memory</button>
+                <form method="post" class="d-block">
+                  <input type="hidden" name="namespace" value="{{ s.namespace }}">
+                  <input type="hidden" name="action" value="delete">
+                  <button class="btn btn-sm btn-outline-danger"
+                          onclick="return confirm('Delete namespace {{ s.namespace }} and everything in it?')">Delete namespace</button>
+                </form>
+              </td>
+            {% endif %}
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="6" class="text-body-secondary">No hapi-fhir deployments found.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if error %}<div class="alert alert-danger mt-3"><pre class="mb-0">{{ error }}</pre></div>{% endif %}
+    {% if message %}<div class="alert alert-secondary mt-3"><pre class="mb-0">{{ message }}</pre></div>{% endif %}
+  </div>
+
+  <div class="col-lg-5">
+    <div class="card">
+      <div class="card-header">Deploy or resize</div>
+      <div class="card-body">
+        <form method="post" id="stack-form">
+          <div class="mb-3">
+            <label class="form-label" for="namespace">Namespace</label>
+            <input class="form-control font-monospace" id="namespace" name="namespace"
+                   placeholder="perf-s" required>
+            <div class="form-text">Deploy creates it if absent, then applies the manifest.</div>
+          </div>
+
+          <table class="table table-sm align-middle">
+            <thead><tr><th></th><th>Min (GiB)</th><th>Max (GiB)</th></tr></thead>
+            <tbody>
+            {% for deployment, container, label, dmin, dmax in components %}
+              <tr>
+                <td>{{ label }}</td>
+                <td><input class="form-control form-control-sm font-monospace" type="number"
+                           step="0.25" min="0.25" name="{{ deployment }}-min" value="{{ dmin }}"></td>
+                <td><input class="form-control form-control-sm font-monospace" type="number"
+                           step="0.25" min="0.25" name="{{ deployment }}-max" value="{{ dmax }}"></td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          <div class="form-text mb-3">
+            Min is <span class="font-monospace">requests.memory</span>, max is
+            <span class="font-monospace">limits.memory</span>. Postgres
+            <span class="font-monospace">shared_buffers</span> and the Elasticsearch heap
+            are derived from max, so they come down with it. The defaults above are the
+            manifest's own numbers.
+          </div>
+
+          <button class="btn btn-primary" name="action" value="deploy">Deploy</button>
+          <button class="btn btn-outline-primary" name="action" value="resize">Resize in place</button>
+        </form>
+      </div>
+      <ul class="list-group list-group-flush">
+        <li class="list-group-item small">manifest <span class="font-monospace">{{ manifest }}</span></li>
+        <li class="list-group-item small">kubeconfig <span class="font-monospace">{{ kubeconfig }}</span></li>
+      </ul>
+    </div>
+    <div class="alert alert-warning mt-3 small mb-0">
+      CPU requests are not scaled: Postgres still asks for 24 cores and Elasticsearch for 10,
+      which gates scheduling on a small node regardless of what you set here.
+    </div>
+  </div>
+</div>
+
+<script>
+// "Edit memory" copies a row's current values into the form, so resizing an
+// existing stack does not mean retyping six numbers.
+document.querySelectorAll('.js-fill').forEach(function (button) {
+  button.addEventListener('click', function () {
+    var form = document.getElementById('stack-form');
+    var stack = JSON.parse(button.dataset.stack);
+    form.namespace.value = stack.namespace;
+    Object.keys(stack).forEach(function (deployment) {
+      var component = stack[deployment];
+      if (!component || !component.min) { return; }
+      setField(form, deployment + '-min', component.min);
+      setField(form, deployment + '-max', component.max);
+    });
+    form.scrollIntoView({block: 'center'});
+  });
+});
+
+function setField(form, name, quantity) {
+  var field = form.elements[name];
+  var gibibytes = parseGi(quantity);
+  if (field && gibibytes !== null) { field.value = gibibytes; }
+}
+
+// Kubernetes quantities come back as Mi/Gi/Ki; the form wants GiB.
+function parseGi(quantity) {
+  var match = /^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti)?$/.exec(quantity || '');
+  if (!match) { return null; }
+  var factor = {Ki: 1 / 1048576, Mi: 1 / 1024, Gi: 1, Ti: 1024}[match[2]] || 1 / 1073741824;
+  return Math.round(parseFloat(match[1]) * factor * 100) / 100;
+}
+</script>
+{% endblock %}

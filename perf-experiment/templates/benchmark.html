@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block head %}
+{% if job.state == 'running' %}<meta http-equiv="refresh" content="5">{% endif %}
+{% endblock %}
+{% block body %}
+<div class="row g-4">
+  <div class="col-lg-3">
+    <div class="card">
+      <div class="card-header">Run the benchmark</div>
+      <div class="card-body">
+        <form method="post">
+          <div class="mb-3">
+            <label class="form-label" for="namespace">Stack</label>
+            <select class="form-select font-monospace" id="namespace" name="namespace" required>
+              {% for s in stacks %}<option value="{{ s.namespace }}">{{ s.namespace }}</option>{% endfor %}
+            </select>
+          </div>
+          <button class="btn btn-primary" {% if job.state == 'running' %}disabled{% endif %}>Run</button>
+        </form>
+      </div>
+      <ul class="list-group list-group-flush small">
+        <li class="list-group-item">8 cases &times; 2 modes</li>
+        <li class="list-group-item">{{ reps }} repetitions, median reported</li>
+        <li class="list-group-item">Cache-Control: no-cache</li>
+        <li class="list-group-item">{{ timeout }} s timeout, no retry</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="col-lg-9">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span>Results{% if job.namespace %} &mdash; <span class="font-monospace">{{ job.namespace }}</span>{% endif %}</span>
+        <span class="badge text-bg-{{ 'primary' if job.state == 'running' else 'success' if job.state == 'done' else 'danger' if job.state == 'failed' else 'secondary' }}">
+          {{ job.state }}{% if job.state == 'running' %} {{ job.done }}/{{ job.total }}{% endif %}
+        </span>
+      </div>
+      {% if job.state == 'idle' %}
+        <div class="card-body text-body-secondary">No run yet.</div>
+      {% else %}
+        <table class="table table-sm mb-0 align-middle">
+          <thead>
+            <tr><th>Case</th><th>Shape</th><th>Mode</th><th class="text-end">Median ms</th>
+                <th class="text-end">Max ms</th><th class="text-end">Total</th><th>Band</th></tr>
+          </thead>
+          <tbody>
+          {% for r in job.results %}
+            <tr {% if r.error %}class="table-danger"{% elif r.censored %}class="table-warning"{% endif %}>
+              <td><strong>{{ r.case }}</strong></td>
+              <td class="small">{{ r.label }}
+                {% if not r.cache_ok and not r.error %}<span class="badge text-bg-warning">cache suspect</span>{% endif %}
+                {% if r.error %}<div class="font-monospace small">{{ r.error }}</div>{% endif %}
+              </td>
+              <td class="small font-monospace">{{ r.mode }}</td>
+              <td class="text-end">{{ '{:,}'.format(r.median_ms) if r.median_ms is not none else '-' }}</td>
+              <td class="text-end">{{ '{:,}'.format(r.max_ms) if r.max_ms is not none else '-' }}</td>
+              <td class="text-end">{{ '{:,}'.format(r.total) if r.total is not none else '-' }}</td>
+              <td>
+                {% if r.censored %}<span class="badge text-bg-dark">unusable</span>
+                {% elif r.median_ms is none %}-
+                {% elif r.median_ms < 2000 %}<span class="badge text-bg-success">interactive</span>
+                {% elif r.median_ms < 10000 %}<span class="badge text-bg-warning">tolerable</span>
+                {% else %}<span class="badge text-bg-danger">async only</span>{% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% if job.last_error %}
+          <div class="card-footer"><pre class="mb-0 small text-danger">{{ job.last_error }}</pre></div>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

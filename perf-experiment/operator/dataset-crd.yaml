@@ -1,0 +1,100 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: fhirdatasets.perf.pkb
+spec:
+  group: perf.pkb
+  scope: Namespaced
+  names:
+    kind: FhirDataset
+    plural: fhirdatasets
+    singular: fhirdataset
+    shortNames: [fds]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: Stack, type: string, jsonPath: .spec.stackRef}
+        - {name: Parallelism, type: integer, jsonPath: .spec.parallelism}
+        - {name: Patients, type: string, jsonPath: .status.patientsDone}
+        - {name: Job, type: string, jsonPath: .status.jobName}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                stackRef:
+                  # FhirStack in this namespace to load into.
+                  type: string
+                seed:
+                  type: integer
+                  default: 20260911
+                parallelism:
+                  # Job parallelism. The knob being swept; everything else is
+                  # held constant so two runs are comparable.
+                  type: integer
+                  default: 4
+                  minimum: 1
+                patients:
+                  type: object
+                  properties:
+                    first: {type: integer, default: 1}
+                    count: {type: integer, default: 1000}
+                shape:
+                  type: object
+                  properties:
+                    heavyEveryN: {type: integer, default: 10}
+                    conditionsPerPatient:
+                      type: object
+                      properties:
+                        normal: {type: integer, default: 11}
+                        heavy: {type: integer, default: 90}
+                    observationsPerPatient:
+                      type: object
+                      properties:
+                        normal: {type: integer, default: 53}
+                        heavy: {type: integer, default: 500}
+                codes:
+                  # SNOMED roots. Resolved once at creation against the
+                  # ontology service and frozen into a ConfigMap.
+                  type: object
+                  properties:
+                    drawFrom:
+                      type: string
+                      enum: [descendants, children, self]
+                      default: descendants
+                    maxCodesPerRoot:
+                      # The ontology service caps descendants at 1000 per call.
+                      # Any truncation is recorded in status.codeNotes.
+                      type: integer
+                      default: 1000
+                    conditions:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          root: {type: string}
+                          weight: {type: number, default: 1}
+                    observations:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          root: {type: string}
+                          weight: {type: number, default: 1}
+                loader:
+                  type: object
+                  properties:
+                    cpu: {type: number, default: 0.5}
+                    memory: {type: number, default: 1}
+                    storageGi: {type: integer, default: 10}
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

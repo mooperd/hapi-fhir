@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block head %}
+{% if job.state == 'running' %}<meta http-equiv="refresh" content="3">{% endif %}
+{% endblock %}
+{% block body %}
+<div class="row g-4">
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header">Load synthetic data</div>
+      <div class="card-body">
+        <form method="post">
+          <div class="mb-3">
+            <label class="form-label" for="namespace">Stack</label>
+            <select class="form-select font-monospace" id="namespace" name="namespace" required>
+              {% for s in stacks %}<option value="{{ s.namespace }}">{{ s.namespace }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="mb-3">
+            <label class="form-label" for="patients">Patients</label>
+            <input class="form-control" id="patients" name="patients" type="number"
+                   min="1" value="10000" required>
+            <div class="form-text">~118 resources each: 1 Patient, 18.9 Conditions, 97.7 Observations on average.</div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label" for="first">First patient serial</label>
+            <input class="form-control" id="first" name="first" type="number" min="1" value="1">
+            <div class="form-text">Set past the last completed serial to resume an interrupted load.</div>
+          </div>
+          <button class="btn btn-primary" {% if job.state == 'running' %}disabled{% endif %}>Start load</button>
+        </form>
+      </div>
+      <ul class="list-group list-group-flush small">
+        <li class="list-group-item">bundle size <strong>{{ bundle_size }}</strong> entries</li>
+        <li class="list-group-item">workers <strong>{{ workers }}</strong></li>
+        <li class="list-group-item">seed <strong>{{ seed }}</strong></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span>Load state</span>
+        <span class="badge text-bg-{{ 'primary' if job.state == 'running' else 'success' if job.state == 'done' else 'danger' if job.state == 'failed' else 'secondary' }}">{{ job.state }}</span>
+      </div>
+      {% if job.state == 'idle' %}
+        <div class="card-body text-body-secondary">Nothing loading.</div>
+      {% else %}
+        <div class="card-body">
+          {% set pct = (100 * job.patients_done / job.patients) if job.patients else 0 %}
+          <div class="progress mb-3" role="progressbar">
+            <div class="progress-bar{% if job.state == 'running' %} progress-bar-striped progress-bar-animated{% endif %}"
+                 style="width: {{ pct }}%">{{ '%.1f'|format(pct) }}%</div>
+          </div>
+          <dl class="row mb-0">
+            <dt class="col-sm-4">Stack</dt><dd class="col-sm-8 font-monospace">{{ job.namespace }}</dd>
+            <dt class="col-sm-4">Patients</dt><dd class="col-sm-8">{{ '{:,}'.format(job.patients_done) }} of {{ '{:,}'.format(job.patients) }} (from serial {{ job.first }})</dd>
+            <dt class="col-sm-4">Resources written</dt><dd class="col-sm-8">{{ '{:,}'.format(job.resources) }}</dd>
+            <dt class="col-sm-4">Bundles</dt><dd class="col-sm-8">{{ '{:,}'.format(job.bundles_ok) }} ok, {{ '{:,}'.format(job.bundles_failed) }} failed</dd>
+            <dt class="col-sm-4">Elapsed</dt><dd class="col-sm-8">{{ '%.0f'|format(job.elapsed) }} s</dd>
+            <dt class="col-sm-4">Rate</dt><dd class="col-sm-8">{{ '{:,.0f}'.format(job.rate) }} resources/s</dd>
+          </dl>
+        </div>
+        {% if job.last_error %}
+          <div class="card-footer"><pre class="mb-0 small text-danger">{{ job.last_error }}</pre></div>
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

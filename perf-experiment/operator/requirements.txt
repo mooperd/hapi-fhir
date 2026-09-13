@@ -1,0 +1,6 @@
+kopf
+kubernetes
+pyyaml
+flask
+requests
+prometheus_client

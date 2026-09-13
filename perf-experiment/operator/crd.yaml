@@ -1,0 +1,91 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: fhirstacks.perf.pkb
+spec:
+  group: perf.pkb
+  scope: Namespaced
+  names:
+    kind: FhirStack
+    plural: fhirstacks
+    singular: fhirstack
+    shortNames: [fs]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: HAPI, type: string, jsonPath: .status.components.hapi}
+        - {name: DB, type: string, jsonPath: .status.components.postgres}
+        - {name: ES, type: string, jsonPath: .status.components.elasticsearch}
+        - {name: Protected, type: boolean, jsonPath: .spec.protected}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                protected:
+                  # Refuses deletion while true. Children carry owner
+                  # references, so deleting a FhirStack takes its PVCs and
+                  # everything on them. Set this on any stack holding data you
+                  # cannot regenerate; clear it deliberately to tear down.
+                  type: boolean
+                  default: false
+                cpuLimitPolicy:
+                  # strict: requests == limits, Guaranteed QoS, reproducible but throttles.
+                  # burst:  requests at min, limits at max. Faster, noisier timings.
+                  # none:   requests only, no CPU limit. Unthrottled; single-tenant nodes.
+                  type: string
+                  enum: [strict, burst, none]
+                  default: burst
+                resources:
+                  type: object
+                  properties:
+                    hapi:
+                      type: object
+                      properties:
+                        cpu:
+                          type: object
+                          properties:
+                            min: {type: number}
+                            max: {type: number}
+                        memory:
+                          type: object
+                          properties:
+                            min: {type: number}
+                            max: {type: number}
+                    postgres:
+                      type: object
+                      properties:
+                        cpu:
+                          type: object
+                          properties:
+                            min: {type: number}
+                            max: {type: number}
+                        memory:
+                          type: object
+                          properties:
+                            min: {type: number}
+                            max: {type: number}
+                    elasticsearch:
+                      type: object
+                      properties:
+                        cpu:
+                          type: object
+                          properties:
+                            min: {type: number}
+                            max: {type: number}
+                        memory:
+                          type: object
+                          properties:
+                            min: {type: number}
+                            max: {type: number}
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
