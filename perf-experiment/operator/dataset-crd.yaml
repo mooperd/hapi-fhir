@@ -1,9 +1,9 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: fhirdatasets.perf.pkb
+  name: fhirdatasets.perf.fhir
 spec:
-  group: perf.pkb
+  group: perf.fhir
   scope: Namespaced
   names:
     kind: FhirDataset
@@ -17,10 +17,12 @@ spec:
       subresources:
         status: {}
       additionalPrinterColumns:
+        - {name: State, type: string, jsonPath: .spec.state}
         - {name: Phase, type: string, jsonPath: .status.phase}
         - {name: Stack, type: string, jsonPath: .spec.stackRef}
-        - {name: Parallelism, type: integer, jsonPath: .spec.parallelism}
-        - {name: Patients, type: string, jsonPath: .status.patientsDone}
+        - {name: Patients, type: integer, jsonPath: .status.observed.Patient}
+        - {name: Want, type: integer, jsonPath: .status.expected.Patient}
+        - {name: Suspended, type: boolean, jsonPath: .spec.suspend}
         - {name: Job, type: string, jsonPath: .status.jobName}
         - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
       schema:
@@ -31,7 +33,32 @@ spec:
               type: object
               properties:
                 stackRef:
-                  # FhirStack in this namespace to load into.
+                  # FhirStack in this namespace. The operator sets an owner
+                  # reference to it, so deleting the stack deletes its datasets.
+                  type: string
+                state:
+                  # Present: the operator loads until the data is there.
+                  # Absent:  the operator deletes until it is gone.
+                  type: string
+                  enum: [Present, Absent]
+                  default: Present
+                maxAttempts:
+                  # How many times a job may finish without closing the gap
+                  # before the dataset is declared Failed.
+                  type: integer
+                  default: 3
+                suspend:
+                  # Pauses the running Job without losing it or its place.
+                  type: boolean
+                  default: false
+                purgeOnDelete:
+                  # Deleting the CR deletes its data. A finalizer holds the
+                  # object until the purge job finishes.
+                  type: boolean
+                  default: true
+                idPrefix:
+                  # Resource id prefix; defaults to the dataset name, which
+                  # keeps two datasets on one stack from colliding.
                   type: string
                 seed:
                   type: integer

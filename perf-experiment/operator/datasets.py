@@ -1,15 +1,24 @@
 # Created by claude-opus-5
-"""FhirDataset: synthetic ingest as a Job, plus the Prometheus that watches it.
+"""FhirDataset: declarative data lifecycle, reconciled by Jobs.
 
-A dataset is an event, not a desired state. Once its Job exists the operator
-never touches it again -- no TTL, no delete-and-recreate, no reacting to spec
-edits. Editing a FhirDataset does nothing; to re-run, make a new one.
+A FhirDataset says what should be in the database. The operator compares that
+to what is actually there and launches a Job to close the gap:
 
-That is deliberate. A Job that disappears and gets recreated silently reloads
-the dataset, and ttlSecondsAfterFinished is exactly what makes it disappear.
+    state: Present, not enough loaded  -> load job
+    state: Absent,  still present      -> delete job
+    deleted while data present         -> delete job, held by a finalizer
+    matches                            -> nothing
 
-Handlers are registered at import. fhir_operator calls init() to hand over the
-shared dynamic client.
+Every resource carries meta.tag http://perf.fhir/dataset|<name>. The tag is the
+only handle on a dataset, and metadata.uid is used because it is unique per
+object and regenerated when a CR of the same name is recreated.
+
+Actual state is reported inward by the Jobs, not polled outward: the operator
+may be running on a laptop with no route to the FHIR service.
+
+Datasets are children of a FhirStack. The operator sets an owner reference to
+the stack named in spec.stackRef, so deleting a stack takes its datasets with
+it and the whole node plus its data can live in one YAML file.
 """
 
 import json
@@ -20,19 +29,17 @@ import requests
 import yaml
 from kubernetes import client
 
-GROUP = "perf.pkb"
+GROUP = "perf.fhir"
 VERSION = "v1alpha1"
 PLURAL = "fhirdatasets"
+STACK_PLURAL = "fhirstacks"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ONTOLOGY = os.environ.get("ONTOLOGY_URL", "https://ontology-main.bloods.co.uk/api/snomed")
 LOADER_IMAGE = os.environ.get("LOADER_IMAGE", "python:3.12-slim")
 ONTOLOGY_TIMEOUT = 120
+TAG_SYSTEM = "http://perf.fhir/dataset"
 
-# Roots used when spec.codes says nothing. A FhirDataset with an empty spec
-# has to produce a working load, the same way a FhirStack without resources
-# gets the operator's sizing defaults. Both are huge and will be truncated to
-# maxCodesPerRoot, which is recorded in status.codeNotes.
 DEFAULT_CONDITION_ROOTS = [{"root": "404684003", "weight": 1}]     # Clinical finding
 DEFAULT_OBSERVATION_ROOTS = [{"root": "363787002", "weight": 1}]   # Observable entity
 
@@ -61,20 +68,12 @@ def _custom():
 # --------------------------------------------------------------------------
 
 def resolve(roots, draw_from, cap, logger, notes):
-    """Expand SNOMED roots into a flat weighted code list.
+    """Expand SNOMED roots into a flat weighted code list, once, at creation.
 
-    Done once, here, and frozen into a ConfigMap. An HTTP call per resource
-    would make the ontology service the bottleneck being measured, and would
-    make two runs of the same seed produce different data.
-
-    A root's weight is shared across its expansion, so the subtree keeps the
-    share you asked for however many descendants it turns out to have.
-
-    The ontology service caps descendants at 1000 per call and does not say so
-    in the payload beyond returned != total -- Observable entity is 21479
-    concepts and comes back as an arbitrary 1000. The cap is passed explicitly
-    as ?count= and any truncation is recorded, so the code mix is never
-    quietly different from the one asked for.
+    An HTTP call per resource would make the ontology service the bottleneck
+    being measured. The service caps descendants at 1000 per call and only
+    signals it via returned != total, so the cap is passed explicitly as
+    ?count= and any truncation is recorded rather than silently applied.
     """
     out = []
     for entry in roots or []:
@@ -93,36 +92,27 @@ def resolve(roots, draw_from, cap, logger, notes):
                     note = "%s: using %d of %d %s" % (root, len(concepts), total, draw_from)
                     logger.warning(note)
                     notes.append(note)
-            except Exception as exc:                       # noqa: BLE001 - reported to status
+            except Exception as exc:                       # noqa: BLE001 - surfaced
                 raise kopf.TemporaryError(
                     "ontology lookup failed for %s: %s" % (root, exc), delay=30)
         if not concepts:
-            # A leaf concept has no descendants; use the root itself.
             try:
                 response = requests.get("%s/concept/%s" % (ONTOLOGY, root),
                                         timeout=ONTOLOGY_TIMEOUT)
                 response.raise_for_status()
-                body = response.json()
-                concepts = [{"code": root, "display": body.get("display", root)}]
-            except Exception as exc:                       # noqa: BLE001 - reported to status
+                concepts = [{"code": root, "display": response.json().get("display", root)}]
+            except Exception as exc:                       # noqa: BLE001 - surfaced
                 raise kopf.TemporaryError(
                     "ontology lookup failed for %s: %s" % (root, exc), delay=30)
-
         share = weight / len(concepts)
         for concept in concepts:
             out.append({"code": str(concept["code"]),
-                        "display": concept.get("display", ""),
-                        "weight": share})
+                        "display": concept.get("display", ""), "weight": share})
     logger.info("resolved %d roots to %d codes", len(roots or []), len(out))
     return out
 
 
-# --------------------------------------------------------------------------
-# Rendering
-# --------------------------------------------------------------------------
-
-def dataset_config(spec, logger):
-    """Frozen generator config, plus any notes about truncated expansions."""
+def dataset_config(spec, name, logger):
     shape = spec.get("shape") or {}
     codes = spec.get("codes") or {}
     draw_from = codes.get("drawFrom", "descendants")
@@ -130,6 +120,8 @@ def dataset_config(spec, logger):
     patients = spec.get("patients") or {}
     notes = []
     config = {
+        "datasetName": name,
+        "prefix": spec.get("idPrefix") or name,
         "seed": int(spec.get("seed", 20260911)),
         "first": int(patients.get("first", 1)),
         "count": int(patients.get("count", 1000)),
@@ -154,12 +146,7 @@ def dataset_config(spec, logger):
 
 
 def _validate(config):
-    """Fail here, not in a worker sixty seconds later.
-
-    An empty code list makes random.choices raise IndexError deep inside the
-    loader, after every worker has paid for a pip install and the Job has
-    burned its backoffLimit. Refuse the dataset instead.
-    """
+    """Fail at admission, not in a worker sixty seconds later."""
     shape = config["shape"]
     for kind, codes_key, shape_key in (
             ("Condition", "conditionCodes", "conditionsPerPatient"),
@@ -167,14 +154,58 @@ def _validate(config):
         wanted = max(shape[shape_key]["normal"], shape[shape_key]["heavy"])
         if wanted > 0 and not config[codes_key]:
             raise kopf.PermanentError(
-                "spec.shape.%s asks for %d %s per patient but spec.codes resolved "
-                "to no codes -- give it a root, or set the count to 0"
-                % (shape_key, wanted, kind))
-        total = sum(c["weight"] for c in config[codes_key])
-        if config[codes_key] and total <= 0:
-            raise kopf.PermanentError(
-                "%s code weights sum to %g; at least one must be positive" % (kind, total))
+                "spec.shape.%s asks for %d %s per patient but spec.codes resolved to no "
+                "codes -- give it a root, or set the count to 0" % (shape_key, wanted, kind))
+        if config[codes_key] and sum(c["weight"] for c in config[codes_key]) <= 0:
+            raise kopf.PermanentError("%s code weights must sum to more than zero" % kind)
 
+
+# --------------------------------------------------------------------------
+# Desired vs actual
+# --------------------------------------------------------------------------
+
+def expected(spec):
+    """Resource counts a fully loaded dataset should have."""
+    shape = spec.get("shape") or {}
+    patients = int((spec.get("patients") or {}).get("count", 1000))
+    every = int(shape.get("heavyEveryN", 10)) or 10
+    heavy = patients // every
+    normal = patients - heavy
+
+    def per(key, normal_default, heavy_default):
+        block = shape.get(key) or {}
+        return (normal * int(block.get("normal", normal_default))
+                + heavy * int(block.get("heavy", heavy_default)))
+
+    return {
+        "Patient": patients,
+        "Condition": per("conditionsPerPatient", 11, 90),
+        "Observation": per("observationsPerPatient", 53, 500),
+    }
+
+
+def decide(spec, status):
+    """What the database needs, as ('load'|'delete'|None, reason)."""
+    want_present = (spec.get("state") or "Present") == "Present"
+    observed = (status or {}).get("observed") or {}
+    seen = sum(int(observed.get(t, 0)) for t in ("Patient", "Condition", "Observation"))
+    target = expected(spec)
+
+    if not want_present:
+        if not observed:
+            return "delete", "state=Absent, nothing observed yet -- delete is idempotent"
+        return ("delete", "state=Absent but %d resources present" % seen) if seen else (None, "absent")
+
+    if not observed:
+        return "load", "state=Present, nothing observed yet"
+    if int(observed.get("Patient", 0)) < target["Patient"]:
+        return "load", "have %d of %d patients" % (observed.get("Patient", 0), target["Patient"])
+    return None, "present: %s" % json.dumps(observed)
+
+
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
 
 def _apply(doc, namespace):
     resource = _dyn().resources.get(api_version=doc["apiVersion"], kind=doc["kind"])
@@ -183,17 +214,13 @@ def _apply(doc, namespace):
 
 
 def config_map(name, config):
-    """dataset.json plus the loader itself, so the Job needs no image build."""
     with open(os.path.join(HERE, "loader.py"), encoding="utf-8") as handle:
         loader = handle.read()
     return {
         "apiVersion": "v1", "kind": "ConfigMap",
         "metadata": {"name": name},
-        "data": {
-            "dataset.json": json.dumps(config),
-            "loader.py": loader,
-            "requirements.txt": "requests\nprometheus_client\n",
-        },
+        "data": {"dataset.json": json.dumps(config), "loader.py": loader,
+                 "requirements.txt": "requests\nprometheus_client\n"},
     }
 
 
@@ -201,15 +228,31 @@ def results_claim(name, size_gi):
     return {
         "apiVersion": "v1", "kind": "PersistentVolumeClaim",
         "metadata": {"name": name},
-        "spec": {
-            "accessModes": ["ReadWriteOnce"],
-            "resources": {"requests": {"storage": "%dGi" % size_gi}},
-        },
+        "spec": {"accessModes": ["ReadWriteOnce"],
+                 "resources": {"requests": {"storage": "%dGi" % size_gi}}},
     }
 
 
-def job(name, dataset, namespace, spec, config_name, claim_name):
-    parallelism = int(spec.get("parallelism", 4))
+def worker_rbac(namespace):
+    """Jobs patch their own FhirDataset status, so they need to be allowed to."""
+    return [
+        {"apiVersion": "v1", "kind": "ServiceAccount",
+         "metadata": {"name": "fhir-loader", "namespace": namespace}},
+        {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+         "metadata": {"name": "fhir-loader", "namespace": namespace},
+         "rules": [{"apiGroups": [GROUP], "resources": ["fhirdatasets", "fhirdatasets/status"],
+                    "verbs": ["get", "list", "patch", "update"]}]},
+        {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+         "metadata": {"name": "fhir-loader", "namespace": namespace},
+         "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role",
+                     "name": "fhir-loader"},
+         "subjects": [{"kind": "ServiceAccount", "name": "fhir-loader",
+                       "namespace": namespace}]},
+    ]
+
+
+def job(job_name, dataset, namespace, spec, mode, config_name, claim_name):
+    parallelism = 1 if mode == "delete" else int(spec.get("parallelism", 4))
     loader = spec.get("loader") or {}
     cpu = float(loader.get("cpu", 0.5))
     memory = float(loader.get("memory", 1))
@@ -217,37 +260,40 @@ def job(name, dataset, namespace, spec, config_name, claim_name):
 
     return {
         "apiVersion": "batch/v1", "kind": "Job",
-        "metadata": {"name": name, "labels": {"app": "fhir-loader", "dataset": dataset}},
+        "metadata": {"name": job_name,
+                     "labels": {"app": "fhir-loader", "dataset": dataset, "mode": mode}},
         "spec": {
-            # Indexed: each worker takes every Nth serial, so shards never
-            # overlap and workers need no coordination.
             "completionMode": "Indexed",
             "completions": parallelism,
             "parallelism": parallelism,
             "backoffLimit": 6,
-            # No ttlSecondsAfterFinished, on purpose. The TTL controller
-            # deleting a finished Job is what makes the operator recreate it
-            # and silently reload the dataset.
+            # suspend is the job control: flip spec.suspend on the CR and the
+            # operator patches this, which stops the pods without losing the
+            # Job or its place.
+            "suspend": bool(spec.get("suspend", False)),
+            # No ttlSecondsAfterFinished. A finished Job that disappears looks
+            # to a reconciler like a Job that never ran.
             "template": {
-                "metadata": {"labels": {"app": "fhir-loader", "dataset": dataset}},
+                "metadata": {"labels": {"app": "fhir-loader", "dataset": dataset,
+                                        "mode": mode}},
                 "spec": {
                     "restartPolicy": "Never",
+                    "serviceAccountName": "fhir-loader",
                     "containers": [{
-                        "name": "loader",
+                        "name": "worker",
                         "image": LOADER_IMAGE,
                         "command": ["/bin/sh", "-c"],
-                        "args": [
-                            "set -e\n"
-                            "pip install --quiet --no-cache-dir --target /deps "
-                            "-r /config/requirements.txt\n"
-                            "exec python /config/loader.py\n"
-                        ],
+                        "args": ["set -e\npip install --quiet --no-cache-dir --target /deps "
+                                 "-r /config/requirements.txt\nexec python /config/loader.py\n"],
                         "env": [
+                            {"name": "MODE", "value": mode},
                             {"name": "FHIR_BASE_URL",
                              "value": "http://hapi-fhir.%s.svc:8080/fhir" % namespace},
                             {"name": "DATASET_CONFIG", "value": "/config/dataset.json"},
                             {"name": "RESULTS_DIR", "value": "/results/%s" % dataset},
                             {"name": "PARALLELISM", "value": str(parallelism)},
+                            {"name": "DATASET_NAME", "value": dataset},
+                            {"name": "POD_NAMESPACE", "value": namespace},
                             {"name": "PYTHONPATH", "value": "/deps"},
                             {"name": "HOME", "value": "/tmp"},
                             {"name": "STACK", "value": stack},
@@ -256,22 +302,19 @@ def job(name, dataset, namespace, spec, config_name, claim_name):
                         "resources": {
                             "requests": {"cpu": "%dm" % round(cpu * 1000),
                                          "memory": "%dMi" % round(memory * 1024)},
-                            "limits": {"memory": "%dMi" % round(memory * 2048)},
-                        },
+                            "limits": {"memory": "%dMi" % round(memory * 2048)}},
                         "volumeMounts": [
                             {"name": "config", "mountPath": "/config", "readOnly": True},
                             {"name": "results", "mountPath": "/results"},
                             {"name": "deps", "mountPath": "/deps"},
-                            {"name": "tmp", "mountPath": "/tmp"},
-                        ],
+                            {"name": "tmp", "mountPath": "/tmp"}],
                     }],
                     "volumes": [
                         {"name": "config", "configMap": {"name": config_name}},
                         {"name": "results",
                          "persistentVolumeClaim": {"claimName": claim_name}},
                         {"name": "deps", "emptyDir": {}},
-                        {"name": "tmp", "emptyDir": {}},
-                    ],
+                        {"name": "tmp", "emptyDir": {}}],
                 },
             },
         },
@@ -279,7 +322,7 @@ def job(name, dataset, namespace, spec, config_name, claim_name):
 
 
 # --------------------------------------------------------------------------
-# Prometheus, one per namespace, shared by every dataset in it
+# Prometheus, one per namespace
 # --------------------------------------------------------------------------
 
 def ensure_prometheus(namespace, logger):
@@ -287,24 +330,20 @@ def ensure_prometheus(namespace, logger):
         "global": {"scrape_interval": "5s"},
         "scrape_configs": [{
             "job_name": "fhir-loader",
-            "kubernetes_sd_configs": [{"role": "pod",
-                                       "namespaces": {"names": [namespace]}}],
+            "kubernetes_sd_configs": [{"role": "pod", "namespaces": {"names": [namespace]}}],
             "relabel_configs": [
-                {"source_labels": ["__meta_kubernetes_pod_label_app"],
-                 "action": "keep", "regex": "fhir-loader"},
-                {"source_labels": ["__meta_kubernetes_pod_ip"],
-                 "target_label": "__address__", "replacement": "$1:9100"},
+                {"source_labels": ["__meta_kubernetes_pod_label_app"], "action": "keep",
+                 "regex": "fhir-loader"},
+                {"source_labels": ["__meta_kubernetes_pod_ip"], "target_label": "__address__",
+                 "replacement": "$1:9100"},
                 {"source_labels": ["__meta_kubernetes_pod_label_dataset"],
                  "target_label": "dataset"},
-                {"source_labels": ["__meta_kubernetes_pod_name"],
-                 "target_label": "pod"},
-            ],
+                {"source_labels": ["__meta_kubernetes_pod_label_mode"], "target_label": "mode"},
+                {"source_labels": ["__meta_kubernetes_pod_name"], "target_label": "pod"}],
         }],
     }
-
     docs = [
-        {"apiVersion": "v1", "kind": "ServiceAccount",
-         "metadata": {"name": "prometheus"}},
+        {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": "prometheus"}},
         {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
          "metadata": {"name": "prometheus"},
          "rules": [{"apiGroups": [""], "resources": ["pods", "services", "endpoints"],
@@ -315,132 +354,239 @@ def ensure_prometheus(namespace, logger):
                      "name": "prometheus"},
          "subjects": [{"kind": "ServiceAccount", "name": "prometheus",
                        "namespace": namespace}]},
-        {"apiVersion": "v1", "kind": "ConfigMap",
-         "metadata": {"name": "prometheus-config"},
+        {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "prometheus-config"},
          "data": {"prometheus.yml": yaml.safe_dump(scrape, sort_keys=False)}},
         {"apiVersion": "apps/v1", "kind": "Deployment",
          "metadata": {"name": "prometheus", "labels": {"app": "prometheus"}},
-         "spec": {
-             "replicas": 1,
-             "selector": {"matchLabels": {"app": "prometheus"}},
-             "template": {
-                 "metadata": {"labels": {"app": "prometheus"}},
-                 "spec": {
-                     "serviceAccountName": "prometheus",
-                     "containers": [{
-                         "name": "prometheus",
-                         "image": "prom/prometheus:v2.55.1",
-                         "args": ["--config.file=/etc/prometheus/prometheus.yml",
-                                  "--storage.tsdb.retention.time=7d"],
-                         "ports": [{"name": "http", "containerPort": 9090}],
-                         "resources": {"requests": {"cpu": "100m", "memory": "512Mi"},
-                                       "limits": {"memory": "2Gi"}},
-                         "volumeMounts": [
-                             {"name": "config", "mountPath": "/etc/prometheus"},
-                             {"name": "data", "mountPath": "/prometheus"},
-                         ],
-                     }],
-                     "volumes": [
-                         {"name": "config",
-                          "configMap": {"name": "prometheus-config"}},
-                         {"name": "data", "emptyDir": {}},
-                     ],
-                 },
-             },
-         }},
-        {"apiVersion": "v1", "kind": "Service",
-         "metadata": {"name": "prometheus"},
+         "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "prometheus"}},
+                  "template": {"metadata": {"labels": {"app": "prometheus"}},
+                               "spec": {"serviceAccountName": "prometheus",
+                                        "containers": [{
+                                            "name": "prometheus",
+                                            "image": "prom/prometheus:v2.55.1",
+                                            "args": ["--config.file=/etc/prometheus/prometheus.yml",
+                                                     "--storage.tsdb.retention.time=7d"],
+                                            "ports": [{"name": "http", "containerPort": 9090}],
+                                            "resources": {
+                                                "requests": {"cpu": "100m", "memory": "512Mi"},
+                                                "limits": {"memory": "2Gi"}},
+                                            "volumeMounts": [
+                                                {"name": "config",
+                                                 "mountPath": "/etc/prometheus"},
+                                                {"name": "data", "mountPath": "/prometheus"}]}],
+                                        "volumes": [
+                                            {"name": "config",
+                                             "configMap": {"name": "prometheus-config"}},
+                                            {"name": "data", "emptyDir": {}}]}}}},
+        {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "prometheus"},
          "spec": {"selector": {"app": "prometheus"},
                   "ports": [{"name": "http", "port": 9090, "targetPort": 9090}]}},
     ]
     for doc in docs:
         doc["metadata"]["namespace"] = namespace
         _apply(doc, namespace)
-    logger.info("prometheus ready in %s", namespace)
 
 
 # --------------------------------------------------------------------------
-# Handlers
+# Reconciliation
 # --------------------------------------------------------------------------
 
-@kopf.on.create(GROUP, VERSION, PLURAL, id="load")
-@kopf.on.resume(GROUP, VERSION, PLURAL, id="reload")
-def ensure(spec, meta, status, namespace, name, patch, logger, **_):
-    """Create the Job once, and never again.
-
-    status.jobName is the latch. It is written before the Job is created, so a
-    crash in between still leaves a name recorded and the retry does nothing.
-    A Job that has been deleted by hand is not recreated -- that is the whole
-    point, and it is why nothing here sets ttlSecondsAfterFinished.
-    """
-    existing = (status or {}).get("jobName")
-    if existing:
-        logger.info("%s already has job %s; nothing to do", name, existing)
+def adopt_to_stack(doc, namespace, stack_name, logger):
+    """Owner reference to the FhirStack, so a stack owns its datasets."""
+    try:
+        stack = _custom().get_namespaced_custom_object(
+            GROUP, VERSION, namespace, STACK_PLURAL, stack_name)
+    except client.ApiException:
+        logger.warning("stack %s/%s not found; dataset will not be owned by it",
+                       namespace, stack_name)
         return
+    doc.setdefault("metadata", {}).setdefault("ownerReferences", []).append({
+        "apiVersion": "%s/%s" % (GROUP, VERSION), "kind": "FhirStack",
+        "name": stack["metadata"]["name"], "uid": stack["metadata"]["uid"],
+        "blockOwnerDeletion": True, "controller": False,
+    })
 
-    job_name = "%s-g%d" % (name, meta.get("generation", 1))
 
-    # Latch first. Status is a subresource, so this is a separate write that
-    # lands before any Job exists.
-    _custom().patch_namespaced_custom_object_status(
-        GROUP, VERSION, namespace, PLURAL, name,
-        {"status": {"jobName": job_name, "phase": "Resolving"}})
+def running_job(namespace, dataset):
+    """The dataset's current job, if any, newest first."""
+    jobs = _batch().list_namespaced_job(
+        namespace, label_selector="dataset=%s" % dataset).items
+    if not jobs:
+        return None
+    jobs.sort(key=lambda j: j.metadata.creation_timestamp, reverse=True)
+    return jobs[0]
 
-    config, notes = dataset_config(spec, logger)
+
+def job_phase(found):
+    if found is None:
+        return None
+    if found.spec.suspend:
+        return "Paused"
+    wanted = found.spec.completions or 1
+    if (found.status.succeeded or 0) >= wanted:
+        return "Complete"
+    if (found.status.failed or 0) and not (found.status.active or 0):
+        return "Failed"
+    return "Active"
+
+
+def _job_name(name, mode, attempt):
+    return "%s-%s-%d" % (name, mode, attempt)
+
+
+def launch(spec, meta, namespace, name, mode, logger, attempt=0,
+           job_name=None):
+    config, notes = dataset_config(spec, name, logger)
     loader = spec.get("loader") or {}
-
     config_name = "%s-config" % name
     claim_name = "%s-results" % name
 
+    for doc in worker_rbac(namespace):
+        _apply(doc, namespace)
     for doc in (config_map(config_name, config),
                 results_claim(claim_name, int(loader.get("storageGi", 10)))):
         doc["metadata"]["namespace"] = namespace
         kopf.adopt(doc)
         _apply(doc, namespace)
-
     ensure_prometheus(namespace, logger)
 
-    body = job(job_name, name, namespace, spec, config_name, claim_name)
+    job_name = job_name or _job_name(name, mode, attempt)
+    body = job(job_name, name, namespace, spec, mode, config_name, claim_name)
     body["metadata"]["namespace"] = namespace
     kopf.adopt(body)
     try:
         _batch().create_namespaced_job(namespace, body)
+        logger.info("launched %s job %s", mode, job_name)
     except client.ApiException as exc:
         if exc.status != 409:
             raise
         logger.info("job %s already exists", job_name)
+    return job_name, notes
 
-    patch.status["phase"] = "Running"
-    patch.status["resolvedCodes"] = len(config["conditionCodes"]) + len(config["observationCodes"])
-    patch.status["resultsPath"] = "/results/%s" % name
+
+@kopf.on.create(GROUP, VERSION, PLURAL, id="own")
+def own(spec, namespace, name, patch, logger, **_):
+    """Attach the dataset to its stack the moment it appears."""
+    stack_name = spec.get("stackRef")
+    if not stack_name:
+        return
+    doc = {"metadata": {}}
+    adopt_to_stack(doc, namespace, stack_name, logger)
+    refs = doc["metadata"].get("ownerReferences")
+    if refs:
+        _custom().patch_namespaced_custom_object(
+            GROUP, VERSION, namespace, PLURAL, name, {"metadata": {"ownerReferences": refs}})
+        logger.info("%s is now owned by FhirStack/%s", name, stack_name)
+    patch.status["phase"] = "Pending"
+
+
+@kopf.timer(GROUP, VERSION, PLURAL, interval=20, id="reconcile")
+def reconcile(spec, meta, status, namespace, name, patch, logger, **_):
+    """Close the gap between what the CR says and what the database holds."""
+    patch.status["expected"] = expected(spec)
+
+    # Loading into a stack that is still starting just burns the Job's
+    # backoffLimit on connection-refused.
+    stack_name = spec.get("stackRef")
+    if stack_name:
+        try:
+            stack = _custom().get_namespaced_custom_object(
+                GROUP, VERSION, namespace, STACK_PLURAL, stack_name)
+        except client.ApiException:
+            patch.status["phase"] = "Waiting"
+            patch.status["reason"] = "stack %s not found" % stack_name
+            return
+        if (stack.get("status") or {}).get("phase") != "Ready":
+            patch.status["phase"] = "Waiting"
+            patch.status["reason"] = "stack %s is %s" % (
+                stack_name, (stack.get("status") or {}).get("phase", "unknown"))
+            return
+
+    found = running_job(namespace, name)
+    phase = job_phase(found)
+
+    # Job control: spec.suspend drives the Job's own suspend field.
+    if found is not None and bool(spec.get("suspend", False)) != bool(found.spec.suspend):
+        _batch().patch_namespaced_job(
+            found.metadata.name, namespace,
+            {"spec": {"suspend": bool(spec.get("suspend", False))}})
+        logger.info("job %s suspend=%s", found.metadata.name, spec.get("suspend"))
+        patch.status["phase"] = "Paused" if spec.get("suspend") else "Active"
+        return
+
+    if phase == "Active" or phase == "Paused":
+        patch.status["phase"] = phase
+        patch.status["jobName"] = found.metadata.name
+        return
+
+    action, reason = decide(spec, status)
+    if action is None:
+        patch.status["phase"] = "Ready" if (spec.get("state") or "Present") == "Present" else "Absent"
+        patch.status["reason"] = reason
+        return
+
+    # A job that finished without closing the gap gets another attempt, up to
+    # a limit. Retrying forever on a broken dataset is as bad as giving up on
+    # a transient failure.
+    attempt = int((status or {}).get("attempt", 0))
+    limit = int(spec.get("maxAttempts", 3))
+    if found is not None and phase in ("Complete", "Failed"):
+        if found.metadata.name == _job_name(name, action, attempt):
+            attempt += 1
+            if attempt >= limit:
+                patch.status["phase"] = "Failed"
+                patch.status["attempt"] = attempt
+                patch.status["reason"] = (
+                    "%s gave up after %d attempts: %s" % (action, attempt, reason))
+                return
+    patch.status["attempt"] = attempt
+    patch.status["reason"] = reason
+    job_name, notes = launch(spec, meta, namespace, name, action, logger,
+                             attempt)
+    patch.status["jobName"] = job_name
+    patch.status["phase"] = "Loading" if action == "load" else "Deleting"
     if notes:
         patch.status["codeNotes"] = notes
-    logger.info("started %s: %d workers over %d patients",
-                job_name, spec.get("parallelism", 4),
-                (spec.get("patients") or {}).get("count", 1000))
 
 
-@kopf.timer(GROUP, VERSION, PLURAL, interval=15, id="progress")
-def progress(status, namespace, name, patch, **_):
-    job_name = (status or {}).get("jobName")
-    if not job_name:
+@kopf.on.delete(GROUP, VERSION, PLURAL, id="purge")
+def purge(spec, meta, status, namespace, name, logger, **_):
+    """Take the data with the CR.
+
+    TemporaryError keeps the finalizer; kopf drops it when a deletion handler
+    produces no delay, so a PermanentError here would let the CR vanish and
+    leave its resources behind.
+
+    The purge job has its own fixed name rather than sharing the reconcile
+    attempt counter. Reusing that counter collided with an already-finished
+    delete job, so create returned 409 every pass and the purge never
+    progressed while still holding the finalizer.
+    """
+    if not spec.get("purgeOnDelete", True):
+        logger.info("purgeOnDelete=false; leaving %s data in place", name)
         return
+
+    observed = (status or {}).get("observed") or {}
+    if observed and not sum(int(observed.get(t, 0)) for t in
+                            ("Patient", "Condition", "Observation")):
+        logger.info("%s already empty", name)
+        return
+
+    purge_name = "%s-purge" % name
     try:
-        found = _batch().read_namespaced_job(job_name, namespace)
-    except client.ApiException:
-        # Deliberately not recreated. Say so rather than quietly reloading.
-        patch.status["phase"] = "JobMissing"
-        return
+        found = _batch().read_namespaced_job(purge_name, namespace)
+    except client.ApiException as exc:
+        if exc.status != 404:
+            raise
+        found = None
 
-    succeeded = found.status.succeeded or 0
-    failed = found.status.failed or 0
-    wanted = found.spec.completions or 1
-    patch.status["workers"] = "%d/%d" % (succeeded, wanted)
-    if failed:
-        patch.status["failedWorkers"] = failed
-    if succeeded >= wanted:
-        patch.status["phase"] = "Complete"
-    elif failed and not (found.status.active or 0):
-        patch.status["phase"] = "Failed"
-    else:
-        patch.status["phase"] = "Running"
+    if found is None:
+        launch(spec, meta, namespace, name, "delete", logger,
+               job_name=purge_name)
+        raise kopf.TemporaryError("purge job %s started" % purge_name, delay=20)
+
+    phase = job_phase(found)
+    if phase == "Complete":
+        logger.info("purge of %s complete", name)
+        return
+    raise kopf.TemporaryError("purge job %s is %s" % (purge_name, phase), delay=20)

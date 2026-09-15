@@ -39,7 +39,7 @@ case "${1:-install}" in
     echo
     echo "Operator removed. CRD and FhirStacks left in place:"
     kubectl get fhirstacks --all-namespaces 2>/dev/null || true
-    echo "  kubectl delete crd fhirstacks.perf.pkb   # deletes every FhirStack and its stack"
+    echo "  kubectl delete crd fhirstacks.perf.fhir   # deletes every FhirStack and its stack"
     exit 0
     ;;
 

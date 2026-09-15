@@ -1,5 +1,5 @@
 # CPU is cores, memory is GiB. Omit a block and the operator's defaults apply.
-apiVersion: perf.pkb/v1alpha1
+apiVersion: perf.fhir/v1alpha1
 kind: FhirStack
 metadata:
   name: perf-s

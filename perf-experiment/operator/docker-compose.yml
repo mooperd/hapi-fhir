@@ -1,0 +1,49 @@
+# Created by claude-opus-5
+#
+#   docker compose up -d --build     start the operator and UI
+#   docker compose restart operator  pick up edited source (no rebuild)
+#   docker compose logs -f           watch it reconcile
+#   docker compose down              stop it
+#
+# The in-cluster Deployment must be scaled to zero while this runs, or two
+# operators reconcile the same objects. ./operator.sh up does both.
+services:
+  operator:
+    build: .
+    container_name: fhir-operator
+    restart: unless-stopped
+
+    # The cluster API is on a VPN route (utun4 on the host), which a bridged
+    # container cannot reach. host mode borrows the host's stack, so the
+    # container resolves 10.211.118.26 exactly as the laptop does.
+    network_mode: host
+
+    volumes:
+      # The operator source, straight off the host. The image still COPYs it so
+      # the image runs standalone, but this mount wins, so an edit to ui.py or
+      # datasets.py needs only ./operator.sh reload -- no rebuild. datasets.py
+      # reads loader.py off this path too, so the loader ConfigMap picks up
+      # local edits on the next reconcile.
+      - ${OPERATOR_SRC:-.}:/app:ro
+      # Read-only: the operator never writes either of these.
+      - ${KUBECONFIG_PATH:-${HOME}/Documents/GitHub/mimic-fhir-downloader/behemoth-andrew-test.yaml}:/kube/config:ro
+      - ${MANIFEST_DIR:-${HOME}/Documents/GitHub/mimic-fhir-downloader}:/manifests:ro
+
+    environment:
+      FHIR_UI_PORT: "8085"
+      # kopf authenticates from KUBECONFIG; the operator's own client reads
+      # FHIR_KUBECONFIG. Both are needed.
+      KUBECONFIG: /kube/config
+      FHIR_KUBECONFIG: /kube/config
+      FHIR_MANIFEST: /manifests/hapi-fhir-standalone.yaml
+      ONTOLOGY_URL: ${ONTOLOGY_URL:-https://ontology-main.bloods.co.uk/api/snomed}
+
+    healthcheck:
+      # kopf's own liveness, not the Flask UI. The UI is a thread inside the
+      # same process and answers even when the reconciler is wedged.
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8086/healthz',timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

@@ -24,7 +24,7 @@ import sys
 import yaml
 from kubernetes import client, config
 
-GROUP = "perf.pkb"
+GROUP = "perf.fhir"
 VERSION = "v1alpha1"
 PLURAL = "fhirstacks"
 

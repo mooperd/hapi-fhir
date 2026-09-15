@@ -120,7 +120,7 @@ capped by `DEFAULT_INTERNAL_SYNCHRONOUS_SEARCH_SIZE` = 10,000
 ## Query matrix
 
 Eight cases. `{C}` = Condition code, `{O}` = Observation code, both with system prefix
-(`http://perf.pkb/cond|COND-RARE-17`).
+(`http://perf.fhir/cond|COND-RARE-17`).
 
 | ID | Shape | Query |
 |----|-------|-------|

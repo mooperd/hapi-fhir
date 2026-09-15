@@ -50,7 +50,7 @@ The cost of that simplification is stated at the end of this document.
 | Field        | Value                                            | Index exercised |
 |--------------|--------------------------------------------------|-----------------|
 | `id`         | `perf-p0000001` … `perf-p<N>` (7 digits, headroom to 10M)                  | `HFJ_RESOURCE`  |
-| `identifier` | system `http://perf.pkb/mrn`, value = serial     | token, unique   |
+| `identifier` | system `http://perf.fhir/mrn`, value = serial     | token, unique   |
 | `gender`     | `male` / `female`, 50/50                         | token, ~50% sel |
 | `birthDate`  | uniform over 1930-01-01 … 2010-12-31             | date            |
 | `name.family`| `Surname0000001` … (one per patient, unique)      | string          |
@@ -72,7 +72,7 @@ lookup step.
 |------------------|----------------------------------------------------------|
 | `id`             | `perf-c<patient-serial>-<NNN>`                                         |
 | `subject`        | `Patient/perf-p0000001`                                   |
-| `code`           | one of 45 codes, system `http://perf.pkb/cond` (see below)|
+| `code`           | one of 45 codes, system `http://perf.fhir/cond` (see below)|
 | `clinicalStatus` | `active`                                                 |
 | `onsetDateTime`  | uniform over 2015-01-01 … 2024-12-31                     |
 
@@ -83,7 +83,7 @@ lookup step.
 | `id`                | `perf-o<patient-serial>-<NNN>`                                        |
 | `subject`           | `Patient/perf-p0000001`                                  |
 | `status`            | `final`                                                 |
-| `code`              | one of 45 codes, system `http://perf.pkb/obs`            |
+| `code`              | one of 45 codes, system `http://perf.fhir/obs`            |
 | `valueQuantity`     | numeric, range and unit fixed per code                  |
 | `effectiveDateTime` | uniform over 2015-01-01 … 2024-12-31                    |
 
@@ -217,7 +217,7 @@ Needs IG confirmation, not settled:
   from the live MIMIC index tables into anything committed to a repository or shared outside the
   cluster, confirm what the DUA permits.
 - The synthetic dataset must not be seeded from real MIMIC values. Codes and identifiers above are
-  invented (`http://perf.pkb/*`) precisely so the output carries no derived patient data and no IG
+  invented (`http://perf.fhir/*`) precisely so the output carries no derived patient data and no IG
   obligation of its own.
 - Confirm where the test cluster and its database sit, and the retention position on the loaded MIMIC
   copy. That is a separate question from this experiment but it is live now.

@@ -27,7 +27,7 @@ rules:
   # Every CRD in the group, not just fhirstacks: the UI discovers kinds at
   # request time, so a CRD added later must work without an RBAC change. The
   # wildcard covers the /status and /finalizers subresources too.
-  - apiGroups: [perf.pkb]
+  - apiGroups: [perf.fhir]
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
 
@@ -50,8 +50,13 @@ rules:
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [roles, rolebindings]
     verbs: [get, list, watch, create, update, patch, delete]
+  # pods/log is the UI's live tail; events are what it falls back to for a pod
+  # that never started and so has no log at all. Both are read-only.
   - apiGroups: [""]
-    resources: [pods, endpoints]
+    resources: [pods, pods/log, endpoints]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [events]
     verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

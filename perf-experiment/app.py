@@ -57,8 +57,8 @@ POST_TIMEOUT = 600      # seconds, per transaction bundle
 QUERY_TIMEOUT = 300     # seconds, per benchmark request
 BENCH_REPS = 3
 
-COND_SYS = "http://perf.pkb/cond"
-OBS_SYS = "http://perf.pkb/obs"
+COND_SYS = "http://perf.fhir/cond"
+OBS_SYS = "http://perf.fhir/obs"
 
 DAY_ZERO = datetime.date(2015, 1, 1)
 DAY_SPAN = 3652                       # 2015-01-01 .. 2024-12-31
@@ -107,7 +107,7 @@ def patient_bundle_entries(serial):
     entries = [_entry({
         "resourceType": "Patient",
         "id": pid,
-        "identifier": [{"system": "http://perf.pkb/mrn", "value": str(serial)}],
+        "identifier": [{"system": "http://perf.fhir/mrn", "value": str(serial)}],
         "gender": "female" if rng.random() < 0.5 else "male",
         "birthDate": str(BIRTH_ZERO + datetime.timedelta(days=rng.randint(0, BIRTH_SPAN))),
         "name": [{"family": "Surname%07d" % serial}],

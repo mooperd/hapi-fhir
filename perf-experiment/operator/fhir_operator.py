@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import datasets  # noqa: E402 - needs the path above
 import ui  # noqa: E402 - needs the path above
 
-GROUP = "perf.pkb"
+GROUP = "perf.fhir"
 VERSION = "v1alpha1"
 PLURAL = "fhirstacks"
 UI_PORT = int(os.environ.get("FHIR_UI_PORT", "8090"))
@@ -178,8 +178,35 @@ def render(spec):
             if doc.get("kind") == "Deployment" and name in by_deployment:
                 key, container_name = by_deployment[name]
                 _resize(doc, container_name, plan[key], policy)
+            if doc.get("kind") == "ConfigMap" and name == "hapi-fhir-config":
+                _enable_expunge(doc)
             docs.append(doc)
     return docs
+
+
+# Dataset deletion needs these four. Without them a conditional delete with
+# _expunge=true is rejected, and the operator cannot reconcile a dataset to
+# Absent. $delete-expunge itself is not registered in the hapiproject image;
+# the _expunge query parameter reaches the same Batch2 job.
+EXPUNGE_SETTINGS = {
+    "expunge_enabled": True,
+    "delete_expunge_enabled": True,
+    "allow_multiple_delete": True,
+    "enforce_referential_integrity_on_delete": False,
+}
+
+
+def _enable_expunge(doc):
+    """Turn on expunge in the rendered HAPI config."""
+    raw = (doc.get("data") or {}).get("application.yaml")
+    if not raw:
+        return
+    parsed = yaml.safe_load(raw)
+    fhir = ((parsed or {}).get("hapi") or {}).get("fhir")
+    if fhir is None:
+        return
+    fhir.update(EXPUNGE_SETTINGS)
+    doc["data"]["application.yaml"] = yaml.safe_dump(parsed, sort_keys=False)
 
 
 def _resize(doc, container_name, size, policy):
@@ -219,7 +246,7 @@ def apply(docs, namespace, logger):
 
 @kopf.on.startup()
 def startup(settings, logger, **_):
-    settings.persistence.finalizer = "perf.pkb/finalizer"
+    settings.persistence.finalizer = "perf.fhir/finalizer"
     settings.posting.level = 20
     # The UI edits FhirStacks; the handlers above react to the edits. It runs
     # in a thread here rather than a second container so it shares one

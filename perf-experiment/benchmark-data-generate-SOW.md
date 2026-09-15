@@ -67,7 +67,7 @@ long-term metric retention.
 ## 4. `FhirDataset`
 
 ```yaml
-apiVersion: perf.pkb/v1alpha1
+apiVersion: perf.fhir/v1alpha1
 kind: FhirDataset
 metadata:
   name: run-01

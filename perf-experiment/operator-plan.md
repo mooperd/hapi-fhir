@@ -126,14 +126,14 @@ it is a field rather than a default buried in code.
 
 ## 4. CRDs
 
-Four kinds, group `perf.pkb/v1alpha1`. Splitting stack from workload is what lets you
+Four kinds, group `perf.fhir/v1alpha1`. Splitting stack from workload is what lets you
 resize between runs without redeploying, and re-run a benchmark against a stack someone
 else loaded.
 
 ### `FhirStack`
 
 ```yaml
-apiVersion: perf.pkb/v1alpha1
+apiVersion: perf.fhir/v1alpha1
 kind: FhirStack
 metadata:
   name: perf-s
@@ -178,7 +178,7 @@ status:
 ### `FhirDataset`
 
 ```yaml
-apiVersion: perf.pkb/v1alpha1
+apiVersion: perf.fhir/v1alpha1
 kind: FhirDataset
 metadata:
   name: perf-s-2m
@@ -214,7 +214,7 @@ range is a no-op. That property should not be configurable away without a warnin
 ### `FhirBenchmark`
 
 ```yaml
-apiVersion: perf.pkb/v1alpha1
+apiVersion: perf.fhir/v1alpha1
 kind: FhirBenchmark
 metadata:
   name: perf-s-chains
@@ -245,7 +245,7 @@ rather than a search.
 This is the piece `app.py` has no answer for. One document describing the whole run.
 
 ```yaml
-apiVersion: perf.pkb/v1alpha1
+apiVersion: perf.fhir/v1alpha1
 kind: FhirExperiment
 metadata:
   name: sweep-postgres-memory
