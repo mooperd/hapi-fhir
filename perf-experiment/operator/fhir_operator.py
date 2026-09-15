@@ -23,6 +23,7 @@ from kubernetes import client, config, dynamic
 
 # kopf loads this file by path and does not put its directory on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import benchmark  # noqa: E402 - needs the path above
 import datasets  # noqa: E402 - needs the path above
 import reconciliation  # noqa: E402 - needs the path above
 import ui  # noqa: E402 - needs the path above
@@ -45,6 +46,18 @@ COMPONENTS = {
 
 PG_BASE_GI = 180.0     # the limit the manifest's postgres args were tuned against
 PG_BASE_CPU = 24.0
+
+# PostgreSQL 18. Pinned here rather than taken from the manifest so the version
+# under measurement is a property of the operator that renders the stack, and
+# so a benchmark result can name it. 18 is wanted for what it exposes about its
+# own reads -- pg_stat_io gains per-backend, per-object and per-context
+# granularity, which is how a benchmark can attribute I/O to the server's own
+# connections instead of to everything on the instance including the observer.
+#
+# A PostgreSQL 16 data directory will not start under 18. There is no in-place
+# upgrade here by design: FhirDataset regenerates deterministically from
+# spec.seed, so the path is a fresh PVC and a reload, not pg_upgrade.
+POSTGRES_IMAGE = os.environ.get("POSTGRES_IMAGE", "postgres:18.6-alpine")
 
 _dyn = None
 
@@ -126,7 +139,20 @@ def postgres_args(cpu_limit, mem_limit_gi):
         return int(max(low, min(high, value)))
 
     workers = max(8, int(2.5 * cpu_limit))
+
+    # PostgreSQL 18 does asynchronous I/O by default (io_method=worker,
+    # io_workers=3). That changes read behaviour, which is the single thing
+    # this stack exists to measure, so every knob on the read path is pinned
+    # explicitly and rendered into status rather than left at a default nobody
+    # recorded. io_workers is 1-32; three is the default and too few to keep a
+    # 24-core instance busy.
     return [
+        "-c", "io_method=worker",
+        "-c", "io_workers=%d" % clamp(cpu_limit // 4, 3, 32),
+        "-c", "io_combine_limit=128kB",
+        "-c", "io_max_combine_limit=128kB",
+        "-c", "effective_io_concurrency=16",
+        "-c", "maintenance_io_concurrency=16",
         "-c", "shared_buffers=%dMB" % mb(65536, 128),
         "-c", "effective_cache_size=%dMB" % mb(163840, 256),
         "-c", "maintenance_work_mem=%dMB" % mb(4096, 64),
@@ -141,8 +167,25 @@ def postgres_args(cpu_limit, mem_limit_gi):
         "-c", "max_wal_size=32GB",
         "-c", "checkpoint_timeout=30min",
         "-c", "wal_buffers=64MB",
-        "-c", "shared_preload_libraries=pg_stat_statements",
+        # auto_explain is preloaded but inert: its log_min_duration defaults to
+        # -1, so it costs nothing until a benchmark turns it on. Preloading is
+        # the only way to have it available for HAPI's connections, and it
+        # needs a postmaster restart, which is not something to discover in the
+        # middle of a run.
+        "-c", "shared_preload_libraries=pg_stat_statements,auto_explain",
     ]
+
+
+def pg_settings(plan):
+    """The rendered postgres tuning, as {name: value}, for status."""
+    size = plan["postgres"]
+    args = postgres_args(size["cpu"][1], size["memory"][1])
+    out = {"image": POSTGRES_IMAGE}
+    for flag, setting in zip(args, args[1:]):
+        if flag == "-c" and "=" in setting:
+            name, _, value = setting.partition("=")
+            out[name] = value
+    return out
 
 
 def elasticsearch_env(cpu_limit, mem_limit_gi):
@@ -176,11 +219,13 @@ def render(spec):
             if not doc:
                 continue
             name = doc.get("metadata", {}).get("name")
+            if doc.get("kind") == "Deployment":
+                _pin_postgres_image(doc)
             if doc.get("kind") == "Deployment" and name in by_deployment:
                 key, container_name = by_deployment[name]
                 _resize(doc, container_name, plan[key], policy)
             if doc.get("kind") == "ConfigMap" and name == "hapi-fhir-config":
-                _enable_expunge(doc)
+                _hapi_settings(doc)
             docs.append(doc)
     return docs
 
@@ -197,8 +242,24 @@ EXPUNGE_SETTINGS = {
 }
 
 
-def _enable_expunge(doc):
-    """Turn on expunge in the rendered HAPI config."""
+# Benchmark controls. These are rendered so the keys EXIST, which is what a
+# FhirBenchmark configure step requires -- it will not create a hapi.fhir
+# setting implicitly, because a key HAPI may not read under a name nobody
+# checked would be reported as a control that took effect when it did not.
+#
+# reuse_cached_search_results_millis is 0 rather than HAPI's 60000 on purpose.
+# HAPI serves an identical repeated search from its own Search cache for a
+# minute by default, so on a benchmarking stack every "hot" number would
+# measure the cache and nothing else. Production runs with the cache on; this
+# stack does not, and says so here.
+BENCHMARK_SETTINGS = {
+    "reuse_cached_search_results_millis": 0,
+    "filter_search_enabled": False,
+}
+
+
+def _hapi_settings(doc):
+    """Render expunge and the benchmark controls into the HAPI config."""
     raw = (doc.get("data") or {}).get("application.yaml")
     if not raw:
         return
@@ -207,7 +268,21 @@ def _enable_expunge(doc):
     if fhir is None:
         return
     fhir.update(EXPUNGE_SETTINGS)
+    for key, value in BENCHMARK_SETTINGS.items():
+        fhir.setdefault(key, value)
     doc["data"]["application.yaml"] = yaml.safe_dump(parsed, sort_keys=False)
+
+
+def _pin_postgres_image(doc):
+    """One PostgreSQL version in play, everywhere it appears.
+
+    hapi-fhir's wait-for-db init container ships pg_isready from whatever major
+    the manifest named, which is a second version to reason about for no gain.
+    """
+    pod = doc["spec"]["template"]["spec"]
+    for container in (pod.get("initContainers") or []) + pod["containers"]:
+        if str(container.get("image", "")).startswith("postgres:"):
+            container["image"] = POSTGRES_IMAGE
 
 
 def _resize(doc, container_name, size, policy):
@@ -218,6 +293,7 @@ def _resize(doc, container_name, size, policy):
             continue
         container["resources"] = quantities(size["cpu"], size["memory"], policy)
         if container_name == "postgres":
+            container["image"] = POSTGRES_IMAGE
             container["args"] = postgres_args(cpu_limit, mem_limit)
         elif container_name == "elasticsearch":
             container["env"] = _merge_env(container.get("env", []),
@@ -254,6 +330,7 @@ def startup(settings, logger, **_):
     # ConfigMap, one pip install and one set of credentials.
     datasets.init(dyn)
     reconciliation.init(dyn)
+    benchmark.init(dyn)
     ui.start(UI_PORT, dyn)
     logger.info("UI listening on :%d", UI_PORT)
 
@@ -265,10 +342,15 @@ def reconcile(spec, namespace, patch, logger, **_):
     """Render and apply. Same path for first create, operator restart and resize."""
     apply(render(spec), namespace, logger)
     patch.status["phase"] = "Provisioning"
+    plan = sizes(spec)
     patch.status["applied"] = {
         key: {"cpu": "%g-%g" % size["cpu"], "memory": "%g-%gGi" % size["memory"]}
-        for key, size in sizes(spec).items()
+        for key, size in plan.items()
     }
+    # Recorded, not assumed. PostgreSQL 18's read path has knobs whose defaults
+    # changed, and a latency number that does not carry the settings it was
+    # produced under cannot be compared with another one.
+    patch.status["postgres"] = pg_settings(plan)
 
 
 @kopf.on.delete(GROUP, VERSION, PLURAL, id="guard")

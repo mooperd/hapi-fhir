@@ -17,6 +17,11 @@ Worker 0 writes the census back to the FhirDataset status using the pod's
 service account, so the operator learns actual state without needing to reach
 the FHIR server itself -- it may be running on a laptop.
 
+It writes one at the start of a job, one every CENSUS_INTERVAL seconds while
+the job runs, and one at the end. Only the last is authoritative and only the
+last can fail the job; the others exist so that status.observed tracks a run in
+flight rather than jumping from nothing to everything when it ends.
+
 Entries are PUT, so a re-run of a finished range is a no-op and the load is
 safely restartable. That is what makes reconciliation cheap.
 """
@@ -43,6 +48,15 @@ PARALLELISM = int(os.environ.get("PARALLELISM", "1"))
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
 POST_TIMEOUT = int(os.environ.get("POST_TIMEOUT", "300"))
 LINGER = int(os.environ.get("LINGER_SECONDS", "20"))
+# How often worker 0 counts what is actually in the database while a job is
+# still running. Matches the operator's own 20s reconcile cadence, so each
+# reconcile pass is likely to see numbers from this side of it. Set to 0 to
+# stop the interim counts: the census is three count queries against the server
+# being loaded, so a run whose purpose is pure write throughput should not pay
+# for progress reporting nobody is reading. The counts at the start and end of
+# a job are not interim and still happen -- the first is the baseline that
+# makes the last one interpretable.
+CENSUS_INTERVAL = int(os.environ.get("CENSUS_INTERVAL_SECONDS", "20"))
 
 DATASET_NAME = os.environ.get("DATASET_NAME", "")
 NAMESPACE = os.environ.get("POD_NAMESPACE", "")
@@ -317,6 +331,47 @@ def census(session, dataset_name):
     return {rtype: count(session, rtype, dataset_name) for rtype in TYPES_YOUNGEST_FIRST}
 
 
+class Periodic:
+    """Counts what is in the database while the job is still running.
+
+    Without this status.observed only moves when a job ends, so a load that
+    takes twenty minutes shows nothing for twenty minutes and then everything
+    at once -- there is no way to tell a slow run from a stuck one.
+
+    Only worker 0 counts, because only worker 0 may report (see report()), and
+    a count nobody can send is server load for nothing. The count covers the
+    whole dataset by tag, not this worker's share, so one worker's census
+    reflects every worker's progress.
+
+    A census that fails mid-run is printed and the run carries on. It is
+    progress reporting, not measurement: the authoritative census is the one
+    at the end of main(), and that one still fails the job if it fails.
+    """
+
+    def __init__(self, session, dataset_name):
+        self.session = session
+        self.dataset_name = dataset_name
+        self.last = 0.0
+        self.taken = 0
+
+    def maybe(self, force=False):
+        if INDEX != 0 or (CENSUS_INTERVAL <= 0 and not force):
+            return
+        now = time.monotonic()
+        if not force and now - self.last < CENSUS_INTERVAL:
+            return
+        self.last = now
+        try:
+            observed = census(self.session, self.dataset_name)
+        except Exception as exc:               # noqa: BLE001 - printed, not swallowed
+            print("FAILURE interim census of %s failed: %s: %s"
+                  % (self.dataset_name, type(exc).__name__, exc), flush=True)
+            return
+        self.taken += 1
+        print("census %d: %s" % (self.taken, observed), flush=True)
+        report(observed)
+
+
 def report(observed, extra=None):
     """Patch the FhirDataset status from inside the pod.
 
@@ -376,6 +431,8 @@ def run_load(session, config):
         out = csv.writer(raw)
         out.writerow(["serial", "entries", "status", "elapsed_ms", "signature"])
         failures = Failures(log, "serial")
+        progress = Periodic(session, config["datasetName"])
+        progress.maybe(force=True)
         for serial in serials:
             bundle = patient_bundle(serial, config)
             entries = len(bundle["entry"])
@@ -404,6 +461,7 @@ def run_load(session, config):
             else:
                 BUNDLES.labels(status="failed").inc()
                 failed += 1
+            progress.maybe()
             if (done + failed) % 100 == 0:
                 raw.flush()
                 print("worker %d: %d done, %d failed, %.0f res/s%s" % (
@@ -433,6 +491,8 @@ def run_delete(session, config):
     os.makedirs(RESULTS_DIR, exist_ok=True)
     log_path = os.path.join(RESULTS_DIR, "delete.log")
     deadline = time.time() + int(os.environ.get("DELETE_TIMEOUT", "7200"))
+    progress = Periodic(session, dataset_name)
+    progress.maybe(force=True)
 
     with open(log_path, "a", encoding="utf-8") as log:
         for rtype in TYPES_YOUNGEST_FIRST:
@@ -473,6 +533,7 @@ def run_delete(session, config):
                         return 1
                     stalled = 0
                 print("delete %s: %d remaining" % (rtype, remaining), flush=True)
+                progress.maybe()
                 time.sleep(10)
             else:
                 print("FAILURE delete of %s timed out with %s still tagged"

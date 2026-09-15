@@ -122,6 +122,16 @@ spec:
                     cpu: {type: number, default: 0.5}
                     memory: {type: number, default: 1}
                     storageGi: {type: integer, default: 10}
+                    censusIntervalSeconds:
+                      # How often worker 0 counts what is actually in the
+                      # database while a job runs, so status.observed tracks a
+                      # run in flight instead of jumping at the end. Matches
+                      # the operator's own reconcile cadence. 0 keeps only the
+                      # counts at the start and end of a job, for a run whose
+                      # purpose is write throughput rather than progress.
+                      type: integer
+                      default: 20
+                      minimum: 0
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true

@@ -1,0 +1,238 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: fhirbenchmarks.perf.fhir
+spec:
+  group: perf.fhir
+  scope: Namespaced
+  names:
+    kind: FhirBenchmark
+    plural: fhirbenchmarks
+    singular: fhirbenchmark
+    shortNames: [fbm]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: Phase,   type: string,  jsonPath: .status.phase}
+        - {name: Run,     type: integer, jsonPath: .status.runId}
+        - {name: Step,    type: string,  jsonPath: .status.currentStepId}
+        - {name: Done,    type: string,  jsonPath: .status.progress}
+        - {name: Stack,   type: string,  jsonPath: .spec.stackRef}
+        - {name: Dataset, type: string,  jsonPath: .spec.datasetRef}
+        - {name: Invalid, type: integer, jsonPath: .status.invalidCount}
+        - {name: Age,     type: date,    jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [stackRef, datasetRef]
+              # C1: the spec is immutable after admission except for the two
+              # run-control fields. A benchmark whose question changed halfway
+              # through is uninterpretable, so the API server rejects the edit
+              # rather than the operator noticing later.
+              x-kubernetes-validations:
+                - rule: "self.stackRef == oldSelf.stackRef"
+                  message: "spec.stackRef is immutable; create a new FhirBenchmark"
+                - rule: "self.datasetRef == oldSelf.datasetRef"
+                  message: "spec.datasetRef is immutable; create a new FhirBenchmark"
+                - rule: "(has(self.catalogue) == has(oldSelf.catalogue)) && (!has(self.catalogue) || self.catalogue == oldSelf.catalogue)"
+                  message: "spec.catalogue is immutable; create a new FhirBenchmark"
+                - rule: "(has(self.defaults) == has(oldSelf.defaults)) && (!has(self.defaults) || self.defaults == oldSelf.defaults)"
+                  message: "spec.defaults is immutable; create a new FhirBenchmark"
+                - rule: "(has(self.plan) == has(oldSelf.plan)) && (!has(self.plan) || self.plan == oldSelf.plan)"
+                  message: "spec.plan is immutable; create a new FhirBenchmark"
+                - rule: "!has(oldSelf.runId) || !has(self.runId) || self.runId >= oldSelf.runId"
+                  message: "spec.runId only ever increases"
+              properties:
+                stackRef:
+                  # FhirStack in this namespace. Must be phase: Ready. No
+                  # namespace-inferred default -- an unstated target is an error.
+                  type: string
+                  minLength: 1
+                datasetRef:
+                  # FhirDataset in this namespace. Must be Ready with
+                  # status.observed at or above status.expected.
+                  type: string
+                  minLength: 1
+                state:
+                  # Run:   advance the plan.
+                  # Hold:  finish the current step, start no further step.
+                  # Abort: stop; remaining steps are Skipped.
+                  type: string
+                  enum: [Run, Hold, Abort]
+                  default: Run
+                runId:
+                  # Increment to re-run. Never auto-incremented, never resumed
+                  # after an operator restart (C4).
+                  type: integer
+                  default: 1
+                  minimum: 1
+                catalogue:
+                  type: object
+                  default: {name: cohort-core}
+                  properties:
+                    name:
+                      type: string
+                      default: cohort-core
+                    revision:
+                      # Pinned catalogue digest. Empty means "whatever is in
+                      # this image"; a mismatch is a PermanentError.
+                      type: string
+                    select:
+                      type: object
+                      properties:
+                        families:
+                          type: array
+                          items: {type: string}
+                        cases:
+                          type: array
+                          items: {type: string}
+                        exclude:
+                          type: array
+                          items: {type: string}
+                defaults:
+                  type: object
+                  default: {}
+                  properties:
+                    concurrency:
+                      # Shards of the measure Job. Engine attribution reads
+                      # pg_stat_statements, which is server-global, so it is
+                      # only performed at concurrency 1.
+                      type: integer
+                      default: 1
+                      minimum: 1
+                    repeats: {type: integer, default: 30, minimum: 1}
+                    warmup: {type: integer, default: 5, minimum: 0}
+                    timeoutSeconds: {type: integer, default: 120, minimum: 1}
+                    bindingMode:
+                      type: string
+                      enum: [pin, rotate]
+                      default: pin
+                    tolerance:
+                      type: object
+                      properties:
+                        rowCountPct: {type: number, default: 0}
+                        coldReadRatioFloor: {type: number, default: 0.8}
+                plan:
+                  # The ordered sequence of events. Not a desired state: a
+                  # benchmark is a one-shot, non-idempotent sequence (C2).
+                  #
+                  # The default below is the cold/prewarm/warm/hot ordering
+                  # from the SOW. It is a schema default, so it is written onto
+                  # the object at admission and is visible in `kubectl get -o
+                  # yaml` -- the object says what it will do rather than the
+                  # operator inferring it. A different experiment is a
+                  # different plan, not different code.
+                  type: array
+                  default:
+                    # Establish, then verify. A condition the benchmark can make
+                    # true itself is made true by a step of this plan and only
+                    # then asserted -- leaving it to autovacuum, to the stack
+                    # renderer, or to whoever loaded the data means measuring a
+                    # database whose state nobody established and nobody checked.
+                    # The door assertions below are only the two things a
+                    # benchmark genuinely cannot fix for itself.
+                    - step: assert
+                      id: preflight
+                      require:
+                        stackReady: true
+                        datasetReady: true
+                        exclusiveLease: true
+                    - step: configure
+                      id: disable-result-cache
+                      hapi:
+                        reuse_cached_search_results_millis: 0
+                    # No relations, so the whole schema. The catalogue reaches
+                    # hfj_spidx_uri, hfj_spidx_number, hfj_res_tag and trm_concept
+                    # as well as the six the assertion checks, and a planner
+                    # working from load-time statistics on any of them produces a
+                    # number that is not the number this benchmark claims to have
+                    # measured.
+                    - step: analyze
+                      id: refresh-stats
+                    # Before the restart, not after: ANALYZE samples pages into
+                    # shared_buffers, and the cold measurement wants that pool
+                    # empty. The restart clears what ANALYZE warmed.
+                    - step: restart
+                      id: cold-start
+                      components: [postgres, elasticsearch, hapi]
+                    - step: settle
+                      id: quiesce
+                      require:
+                        deploymentsReady: true
+                        endpointServing: true
+                    # After the restart, so it verifies what the running server
+                    # was started with rather than what a ConfigMap said an hour
+                    # ago -- and so that statistics lost to an unclean PostgreSQL
+                    # shutdown are caught here, before a single query is timed,
+                    # rather than silently priced into every result.
+                    - step: assert
+                      id: controls-in-place
+                      require:
+                        searchResultCacheDisabled: true
+                        analyzedSinceLoad: true
+                    - step: measure
+                      id: cold
+                      repeats: 1
+                      warmup: 0
+                      bindingMode: rotate
+                      cacheLabel: cold-shared-buffers
+                    - step: prewarm
+                      id: warm-indexes
+                      relations: [hfj_spidx_token, hfj_spidx_date, hfj_spidx_quantity,
+                                  hfj_spidx_string, hfj_res_link, hfj_resource]
+                    - step: measure
+                      id: warm
+                      cacheLabel: warm
+                    - step: measure
+                      id: hot
+                      bindingMode: pin
+                      cacheLabel: hot
+                    - step: report
+                      id: summarise
+                  items:
+                    type: object
+                    required: [step, id]
+                    properties:
+                      step:
+                        type: string
+                        enum: [assert, configure, restart, settle, prewarm, analyze, measure, report]
+                      id: {type: string, minLength: 1}
+                      repeats: {type: integer, minimum: 1}
+                      warmup: {type: integer, minimum: 0}
+                      concurrency: {type: integer, minimum: 1}
+                      cacheLabel: {type: string}
+                      bindingMode:
+                        type: string
+                        enum: [pin, rotate]
+                      components:
+                        type: array
+                        items:
+                          type: string
+                          enum: [postgres, elasticsearch, hapi]
+                      relations:
+                        type: array
+                        items: {type: string}
+                      hapi:
+                        # hapi.fhir.* keys in the stack ConfigMap. The key must
+                        # already be present; it is never created implicitly.
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      require:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                worker:
+                  type: object
+                  properties:
+                    cpu: {type: number, default: 1}
+                    memory: {type: number, default: 2}
+                    storageGi: {type: integer, default: 10}
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

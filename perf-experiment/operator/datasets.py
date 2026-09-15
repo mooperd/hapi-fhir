@@ -299,6 +299,8 @@ def job(job_name, dataset, namespace, spec, mode, config_name, claim_name):
                             {"name": "PYTHONPATH", "value": "/deps"},
                             {"name": "HOME", "value": "/tmp"},
                             {"name": "STACK", "value": stack},
+                            {"name": "CENSUS_INTERVAL_SECONDS",
+                             "value": str(int(loader.get("censusIntervalSeconds", 20)))},
                         ],
                         "ports": [{"name": "metrics", "containerPort": 9100}],
                         "resources": {
@@ -331,16 +333,19 @@ def ensure_prometheus(namespace, logger):
     scrape = {
         "global": {"scrape_interval": "5s"},
         "scrape_configs": [{
-            "job_name": "fhir-loader",
+            "job_name": "fhir-workers",
             "kubernetes_sd_configs": [{"role": "pod", "namespaces": {"names": [namespace]}}],
             "relabel_configs": [
                 {"source_labels": ["__meta_kubernetes_pod_label_app"], "action": "keep",
-                 "regex": "fhir-loader"},
+                 "regex": "fhir-loader|fhir-benchmark"},
                 {"source_labels": ["__meta_kubernetes_pod_ip"], "target_label": "__address__",
                  "replacement": "$1:9100"},
                 {"source_labels": ["__meta_kubernetes_pod_label_dataset"],
                  "target_label": "dataset"},
                 {"source_labels": ["__meta_kubernetes_pod_label_mode"], "target_label": "mode"},
+                {"source_labels": ["__meta_kubernetes_pod_label_benchmark"],
+                 "target_label": "benchmark"},
+                {"source_labels": ["__meta_kubernetes_pod_label_step"], "target_label": "step"},
                 {"source_labels": ["__meta_kubernetes_pod_name"], "target_label": "pod"}],
         }],
     }

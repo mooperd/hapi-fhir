@@ -488,6 +488,12 @@ def start_purge(namespace, dataset, spec, logger):
                             {"name": "POD_NAMESPACE", "value": namespace},
                             {"name": "PYTHONPATH", "value": "/deps"},
                             {"name": "HOME", "value": "/tmp"},
+                            # A purge polls one type at a time; this is what
+                            # keeps status.observed moving across all three
+                            # while it drains.
+                            {"name": "CENSUS_INTERVAL_SECONDS",
+                             "value": str(int((spec.get("loader") or {})
+                                              .get("censusIntervalSeconds", 20)))},
                         ],
                         "ports": [{"name": "metrics", "containerPort": 9100}],
                         "volumeMounts": [

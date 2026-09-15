@@ -27,10 +27,12 @@ from flask import (Flask, Response, redirect, render_template_string, request,
                    url_for)
 from kubernetes import client
 
+import catalogue
 import datasets
 
 GROUP = "perf.fhir"
 DATASET_PLURAL = "fhirdatasets"
+BENCHMARK_PLURAL = "fhirbenchmarks"
 PROM_URL = os.environ.get("PROM_URL_TEMPLATE", "http://prometheus.%s.svc:9090")
 PROM_TIMEOUT = float(os.environ.get("PROM_TIMEOUT", "2"))
 
@@ -448,12 +450,16 @@ def jobs_index():
     return out, None
 
 
-def pods_for(namespace, dataset):
-    """Loader pods for one dataset, so a failing worker is visible by name."""
+def pods_for(namespace, name, app="fhir-loader", key="dataset"):
+    """Worker pods for one object, so a failing worker is visible by name.
+
+    Parameterised by label rather than hard-coded: a benchmark's pods differ
+    from a loader's only in which two labels they carry.
+    """
     try:
         found = _core().list_namespaced_pod(
             namespace,
-            label_selector="app=fhir-loader,dataset=%s" % dataset).items
+            label_selector="app=%s,%s=%s" % (app, key, name)).items
     except client.ApiException as exc:
         return [], "%s %s" % (exc.status, exc.reason)
     found.sort(key=lambda p: p.metadata.name)
@@ -684,14 +690,15 @@ def log_stream(namespace, targets, previous=False, timestamps=False, tail=LOG_TA
             close_quietly(response)
 
 
-def log_targets(namespace, dataset, pod=None, job=None):
+def log_targets(namespace, owner, pod=None, job=None, app="fhir-loader",
+                key="dataset"):
     """Which pods a log request means.
 
     The operator holds cluster-wide credentials, so the pod name off the query
-    string is resolved against this dataset's own pods rather than handed to the
+    string is resolved against this object's own pods rather than handed to the
     API as given.
     """
-    found, error = pods_for(namespace, dataset)
+    found, error = pods_for(namespace, owner, app, key)
     if error:
         return [], error
     if job:
@@ -807,6 +814,205 @@ def metrics(namespace, dataset):
     return out, totals, "; ".join(errors) or None
 
 
+
+# ------------------------------------------------------------- benchmarks
+#
+# A FhirBenchmark is not a state to converge on, so its row shows different
+# things from a FhirDataset's: where the plan has got to, what each step did,
+# and the percentiles that came out. The journal is the primary output, not a
+# summary of live state, so it is rendered in full rather than reduced.
+
+
+def benchmark_jobs_index():
+    """{(namespace, benchmark): [job, ...]} for every benchmark Job."""
+    try:
+        found = _batch().list_job_for_all_namespaces(
+            label_selector="app=fhir-benchmark").items
+    except client.ApiException as exc:
+        return {}, "%s %s" % (exc.status, exc.reason)
+    found.sort(key=lambda j: j.metadata.creation_timestamp, reverse=True)
+    out = {}
+    for job in found:
+        labels = job.metadata.labels or {}
+        out.setdefault((job.metadata.namespace, labels.get("benchmark")), []).append(
+            benchmark_job_row(job))
+    return out, None
+
+
+def benchmark_job_row(job):
+    row = job_row(job)
+    labels = job.metadata.labels or {}
+    row["step"] = labels.get("step", "")
+    row["run"] = labels.get("run", "")
+    return row
+
+
+def benchmark_jobs_for(namespace, name):
+    try:
+        found = _batch().list_namespaced_job(
+            namespace, label_selector="app=fhir-benchmark,benchmark=%s" % name).items
+    except client.ApiException as exc:
+        return [], "%s %s" % (exc.status, exc.reason)
+    found.sort(key=lambda j: j.metadata.creation_timestamp, reverse=True)
+    return [benchmark_job_row(j) for j in found], None
+
+
+def journal_rows(status):
+    """The append-only step journal, oldest first, with durations."""
+    out = []
+    for item in sorted(status.get("journal") or [], key=lambda e: e.get("index", 0)):
+        started = parse_time(item.get("startedAt"))
+        finished = parse_time(item.get("finishedAt"))
+        out.append({
+            "index": item.get("index"),
+            "id": item.get("id", ""),
+            "step": item.get("step", ""),
+            "outcome": item.get("outcome", ""),
+            "job": item.get("jobName", ""),
+            "node": item.get("node", ""),
+            "shards": item.get("shards"),
+            "measurements": item.get("measurements"),
+            "invalid": item.get("invalid"),
+            "coldReadRatio": item.get("coldReadRatio"),
+            "reasons": item.get("invalidReasons") or [],
+            "detail": item.get("detail") or item.get("before") or {},
+            "started": item.get("startedAt", ""),
+            "duration": age(started, finished) if started and finished
+                        else (age(started) if started else "-"),
+        })
+    return out
+
+
+def summary_rows(status, full=False):
+    """One row per (case, cache label). Percentiles came from raw samples."""
+    summary = status.get("summaryFull" if full else "summary") or {}
+    out = []
+    for case_id in sorted(summary):
+        for label in sorted(summary[case_id]):
+            entry = summary[case_id][label]
+            out.append({
+                "case": case_id, "cache": label,
+                "family": entry.get("family", ""),
+                "n": entry.get("n"), "invalid": entry.get("invalid"),
+                "p50": entry.get("p50ms"), "p90": entry.get("p90ms"),
+                "p95": entry.get("p95ms"), "p99": entry.get("p99ms"),
+                "max": entry.get("maxms"),
+                "rows": entry.get("rows"), "total": entry.get("bundleTotal"),
+                "engine": entry.get("engine", ""),
+                "expected": entry.get("engineExpected") or "",
+                "reasons": entry.get("reasons") or [],
+            })
+    out.sort(key=lambda r: (-(r["p95"] or 0), r["case"]))
+    return out
+
+
+def delta_rows(status):
+    """Matched-pair deltas: the measured value of Elasticsearch, per shape."""
+    out = []
+    for name, labels in sorted((status.get("deltas") or {}).items()):
+        for label, entry in sorted(labels.items()):
+            out.append({"pair": name, "cache": label,
+                        "eligible": entry.get("eligibleP50ms"),
+                        "disqualified": entry.get("disqualifiedP50ms"),
+                        "ratio": entry.get("ratio"),
+                        "eligibleEngine": entry.get("eligibleEngine", ""),
+                        "disqualifiedEngine": entry.get("disqualifiedEngine", "")})
+    out.sort(key=lambda r: -(r["ratio"] or 0))
+    return out
+
+
+
+def runnable_targets():
+    """(stacks, datasets) for the run-a-benchmark dropdowns.
+
+    Both are listed cluster-wide with their phase, because a benchmark refuses
+    to run against a stack that is not Ready or a dataset that is not fully
+    loaded -- and it is better to see why in the dropdown than to find out from
+    a PermanentError thirty seconds later.
+    """
+    stacks, datasets, errors = [], [], []
+    for plural, out in (("fhirstacks", stacks), (DATASET_PLURAL, datasets)):
+        try:
+            found = _custom().list_cluster_custom_object(GROUP, "v1alpha1", plural)
+        except client.ApiException as exc:
+            errors.append("%s: %s %s" % (plural, exc.status, exc.reason))
+            continue
+        for item in found.get("items", []):
+            status = item.get("status") or {}
+            namespace = item["metadata"].get("namespace", "")
+            name = item["metadata"]["name"]
+            phase = status.get("phase", "")
+            if plural == DATASET_PLURAL:
+                expected = status.get("expected") or {}
+                observed = status.get("observed") or {}
+                loaded = bool(expected) and all(
+                    int(observed.get(k, 0)) >= int(v) for k, v in expected.items())
+                ready = phase == "Ready" and loaded
+                note = "%s, %s patients" % (phase or "unset",
+                                            fmt(observed.get("Patient", 0)))
+            else:
+                ready = phase == "Ready"
+                note = phase or "unset"
+            out.append({"key": "%s/%s" % (namespace, name), "namespace": namespace,
+                        "name": name, "phase": phase, "ready": ready, "note": note})
+    stacks.sort(key=lambda o: o["key"])
+    datasets.sort(key=lambda o: o["key"])
+    return stacks, datasets, "; ".join(errors) or None
+
+
+def start_run(crd, form):
+    """Create a FhirBenchmark over the whole catalogue from the run panel.
+
+    A fresh object every time rather than a re-run of an existing one: spec is
+    immutable after admission, so editing one in place is rejected by the API
+    server. The name carries a timestamp for the same reason.
+    """
+    stack = (form.get("runStack") or "").strip()
+    dataset = (form.get("runDataset") or "").strip()
+    if not stack or not dataset:
+        raise ValueError("pick a FhirStack and a FhirDataset")
+    stack_ns, _, stack_name = stack.partition("/")
+    dataset_ns, _, dataset_name = dataset.partition("/")
+    if stack_ns != dataset_ns:
+        raise ValueError(
+            "FhirStack %s and FhirDataset %s are in different namespaces; a "
+            "benchmark resolves both in its own namespace" % (stack, dataset))
+
+    repeats = int(form.get("runRepeats") or 30)
+    name = (form.get("runName") or "").strip() or "all-%s" % datetime.datetime.now(
+        datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    spec = {
+        "stackRef": stack_name,
+        "datasetRef": dataset_name,
+        "state": "Run",
+        "runId": 1,
+        # No select block, so every case in the catalogue runs.
+        "catalogue": {"name": "cohort-core"},
+        # concurrency 1 is what makes the cases run one after another, and it
+        # is also the only setting under which pg_stat_statements can attribute
+        # an engine to a case.
+        "defaults": {"concurrency": 1, "repeats": repeats, "warmup": 5,
+                     "timeoutSeconds": 120, "bindingMode": "pin"},
+    }
+    apply_object(crd, dataset_ns, name, spec)
+    return ("started %s %s/%s -- %d cases, %d repeats, sequential"
+            % (crd["kind"], dataset_ns, name, len(catalogue.load("cohort-core")), repeats))
+
+
+def decorate_benchmarks(found):
+    """What a FhirBenchmark row shows under its main line."""
+    index, error = benchmark_jobs_index()
+    for obj in found:
+        status = obj["status"]
+        obj["journal"] = journal_rows(status)
+        obj["jobs"] = index.get((obj["namespace"], obj["name"]), [])
+        obj["summary"] = summary_rows(status)
+        obj["deltas"] = delta_rows(status)
+        obj["bindings"] = sorted((status.get("bindings") or {}).items())
+    return error
+
+
 def decorate(found):
     """Attach the detail a FhirDataset row shows under its main line.
 
@@ -849,7 +1055,9 @@ def kind(plural):
         namespace = (request.form.get("namespace") or "").strip()
         name = (request.form.get("name") or "").strip()
         try:
-            if request.form.get("action") == "set":
+            if request.form.get("action") == "run":
+                message = start_run(crd, request.form)
+            elif request.form.get("action") == "set":
                 message = set_field(crd, namespace, name,
                                     request.form["field"], request.form["value"], flat)
             elif request.form.get("action") == "delete":
@@ -872,17 +1080,29 @@ def kind(plural):
 
     found, error = objects(crd)
     show_jobs = crd["plural"] == DATASET_PLURAL
+    show_benchmark = crd["plural"] == BENCHMARK_PLURAL
     if show_jobs and not error:
         error = decorate(found)
+    if show_benchmark and not error:
+        error = decorate_benchmarks(found)
     editing = None
     want = request.args.get("edit")
     if want:
         editing = next((o for o in found if "%s/%s" % (o["namespace"], o["name"]) == want), None)
 
+    stacks, dataset_targets, target_error = ([], [], None)
+    if show_benchmark:
+        stacks, dataset_targets, target_error = runnable_targets()
+
     return render_template_string(
         PAGE, crds=crds(), crd=crd, objects=found, flat=flat, flags=flags(flat),
-        editing=editing, error=error, message=message, lookup=lookup, fmt=fmt,
-        show_jobs=show_jobs)
+        editing=editing, error=error or target_error, message=message,
+        lookup=lookup, fmt=fmt,
+        show_jobs=show_jobs, show_benchmark=show_benchmark,
+        families=catalogue.families_in() if show_benchmark else [],
+        catalogue_revision=catalogue.revision("cohort-core") if show_benchmark else "",
+        case_count=len(catalogue.load("cohort-core")) if show_benchmark else 0,
+        stacks=stacks, dataset_targets=dataset_targets)
 
 
 @app.route("/fhirdatasets/<namespace>/<name>")
@@ -992,6 +1212,149 @@ def dataset_log_download(namespace, name):
 
 
 
+@app.route("/fhirbenchmarks/<namespace>/<name>")
+def benchmark_detail(namespace, name):
+    """The whole journal and the whole summary for one run.
+
+    status.journal is the primary output of a benchmark rather than a
+    reflection of live state, so this page reads it as a record: what ran,
+    in what order, on which node, and what came out.
+    """
+    crd = find(BENCHMARK_PLURAL)
+    if crd is None:
+        return redirect(url_for("index"))
+
+    obj, error = None, None
+    try:
+        obj = _custom().get_namespaced_custom_object(
+            GROUP, crd["version"], namespace, BENCHMARK_PLURAL, name)
+    except client.ApiException as exc:
+        error = "%s %s" % (exc.status, exc.reason)
+
+    status = (obj or {}).get("status") or {}
+    jobs, job_error = benchmark_jobs_for(namespace, name)
+    pods, pod_error = pods_for(namespace, name, "fhir-benchmark", "benchmark")
+
+    return render_template_string(
+        BENCHMARK, crds=crds(), crd=crd, namespace=namespace, name=name,
+        obj=obj, status=status, spec=(obj or {}).get("spec") or {},
+        journal=journal_rows(status), rows=summary_rows(status, full=True),
+        deltas=delta_rows(status), jobs=jobs, pods=pods, fmt=fmt,
+        bindings=sorted((status.get("bindings") or {}).items()),
+        plan=((obj or {}).get("spec") or {}).get("plan") or [],
+        error=error or job_error or pod_error)
+
+
+@app.route("/fhirbenchmarks/<namespace>/<name>/logs")
+def benchmark_logs(namespace, name):
+    """Live tail of the benchmark worker pods."""
+    crd = find(BENCHMARK_PLURAL)
+    if crd is None:
+        return redirect(url_for("index"))
+
+    pods, error = pods_for(namespace, name, "fhir-benchmark", "benchmark")
+    job = request.args.get("job") or ""
+    if job:
+        pods = [p for p in pods if p["job"] == job]
+    want = request.args.get("pod") or "all"
+    if want != "all" and not any(p["name"] == want for p in pods):
+        want = "all"
+
+    return render_template_string(
+        LOGS, crds=crds(), crd=crd, namespace=namespace, name=name,
+        pods=pods, job=job, want=want, error=error,
+        previous=request.args.get("previous") == "1",
+        timestamps=request.args.get("ts") == "1",
+        tail=LOG_TAIL, cap=int(LOG_STREAM_SECONDS // 60),
+        plural=BENCHMARK_PLURAL)
+
+
+@app.route("/fhirbenchmarks/<namespace>/<name>/logs/stream")
+def benchmark_log_stream(namespace, name):
+    targets, error = log_targets(namespace, name, request.args.get("pod"),
+                                 request.args.get("job"), "fhir-benchmark", "benchmark")
+    if error:
+        return Response(error, status=502, mimetype="text/plain")
+    if not targets:
+        return Response("no such benchmark pod for %s/%s" % (namespace, name),
+                        status=404, mimetype="text/plain")
+    body = log_stream(namespace, targets,
+                      previous=request.args.get("previous") == "1",
+                      timestamps=request.args.get("ts") == "1")
+    return Response(body, mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive"})
+
+
+@app.route("/fhirbenchmarks/<namespace>/<name>/results.json")
+def benchmark_results(namespace, name):
+    """The full summary as JSON. status.summary in the list is the headline
+    only; this is every case at every cache label."""
+    crd = find(BENCHMARK_PLURAL)
+    if crd is None:
+        return redirect(url_for("index"))
+    try:
+        obj = _custom().get_namespaced_custom_object(
+            GROUP, crd["version"], namespace, BENCHMARK_PLURAL, name)
+    except client.ApiException as exc:
+        return Response("%s %s" % (exc.status, exc.reason), status=exc.status,
+                        mimetype="text/plain")
+    status = obj.get("status") or {}
+    body = json.dumps({
+        "name": name, "namespace": namespace,
+        "runId": status.get("runId"), "phase": status.get("phase"),
+        "catalogue": status.get("catalogueName"),
+        "catalogueRevision": status.get("catalogueRevision"),
+        "bindings": status.get("bindings"),
+        "seed": status.get("seed"),
+        "journal": status.get("journal"),
+        "summary": status.get("summaryFull"),
+        "deltas": status.get("deltas"),
+        "invalidCount": status.get("invalidCount"),
+    }, indent=2)
+    return Response(body, mimetype="application/json", headers={
+        "Content-Disposition": 'attachment; filename="%s-run%s.json"'
+                               % (name, status.get("runId"))})
+
+
+@app.route("/fhirbenchmarks/<namespace>/<name>/logs/download")
+def benchmark_log_download(namespace, name):
+    """The whole log, not the tail, as a file. follow=False, so this ends."""
+    targets, error = log_targets(namespace, name, request.args.get("pod"),
+                                 request.args.get("job"), "fhir-benchmark", "benchmark")
+    if error:
+        return Response(error, status=502, mimetype="text/plain")
+    if not targets:
+        return Response("no such benchmark pod for %s/%s" % (namespace, name),
+                        status=404, mimetype="text/plain")
+    previous = request.args.get("previous") == "1"
+    timestamps = request.args.get("ts") == "1"
+
+    def body():
+        for target in targets:
+            if len(targets) > 1:
+                yield "=== %s ===\n" % target["name"]
+            for line in log_lines(namespace, target["name"], follow=False, tail=None,
+                                  previous=previous, timestamps=timestamps):
+                yield line + "\n"
+
+    which = request.args.get("pod") or request.args.get("job") or "all"
+    return Response(body(), mimetype="text/plain; charset=utf-8", headers={
+        "Content-Disposition": 'attachment; filename="%s-%s.log"' % (name, which)})
+
+
+@app.route("/catalogue")
+def catalogue_page():
+    """The version-controlled case list, so a selection can be made informed."""
+    name = request.args.get("name") or "cohort-core"
+    cases = catalogue.load(name)
+    return render_template_string(
+        CATALOGUE, crds=crds(), crd=find(BENCHMARK_PLURAL), name=name,
+        revision=catalogue.revision(name), cases=cases,
+        families=catalogue.families_in(name))
+
+
 PAGE = """
 <!doctype html>
 <html lang="en"><head>
@@ -1062,10 +1425,14 @@ PAGE = """
   </form>
 {% endmacro %}
 
-{% macro row_actions(o, crd, show_jobs) %}
+{% macro row_actions(o, crd, show_jobs, show_benchmark=False) %}
   {% if show_jobs %}
   <a class="btn btn-sm btn-outline-primary"
      href="/fhirdatasets/{{ o.namespace }}/{{ o.name }}">Jobs &amp; metrics</a>
+  {% endif %}
+  {% if show_benchmark %}
+  <a class="btn btn-sm btn-outline-primary"
+     href="/fhirbenchmarks/{{ o.namespace }}/{{ o.name }}">Journal &amp; results</a>
   {% endif %}
   <a class="btn btn-sm btn-outline-secondary"
      href="/{{ crd.plural }}?edit={{ o.namespace }}/{{ o.name }}#editor">Edit</a>
@@ -1169,7 +1536,7 @@ PAGE = """
           {% else %}
             <div class="small text-body-secondary">
               Nothing counted yet. The loader reports a census inward when it
-              starts and again when it finishes.</div>
+              starts, every 20s while it runs, and again when it finishes.</div>
           {% endfor %}
           {% for note in o.status.codeNotes or [] %}
             <div class="small text-warning-emphasis">{{ note }}</div>
@@ -1227,6 +1594,128 @@ PAGE = """
     No {{ crd.kind }} objects. Use the form below.</div></div>
 {% endfor %}
 
+{% elif show_benchmark %}
+{# ------------------------------------------------------- benchmark cards
+   A benchmark is a sequence, not a state, so the row shows where the plan has
+   got to and what each step recorded. status.journal is the primary output --
+   it is the record of what happened, not a reflection of what is true now. #}
+<div class="card mb-3"><div class="card-body py-2 d-flex flex-wrap gap-3 align-items-center">
+  <span class="small text-body-secondary text-uppercase fw-semibold">Catalogue</span>
+  <span class="font-monospace small">cohort-core</span>
+  <span class="font-monospace small text-body-secondary text-truncate"
+        style="max-width: 24rem">{{ catalogue_revision }}</span>
+  {% for family, count in families %}
+    <span class="badge text-bg-light border font-monospace">{{ family }} {{ count }}</span>
+  {% endfor %}
+  <a class="btn btn-sm btn-outline-secondary ms-auto" href="/catalogue">Browse cases</a>
+</div></div>
+
+{% for o in objects %}
+  <div class="card mb-3">
+    <div class="card-body py-2">
+      <div class="row g-3 align-items-center">
+        <div class="col-xl-3">
+          <div class="fw-semibold font-monospace text-truncate">{{ o.name }}</div>
+          <div class="small text-body-secondary font-monospace">
+            {{ o.namespace }} &middot; {{ o.age }} old &middot;
+            stack {{ o.spec.stackRef }} &middot; data {{ o.spec.datasetRef }}</div>
+        </div>
+        <div class="col-xl-3">
+          {{ phase_badge(o.phase, o.deleting) }}
+          <span class="badge text-bg-light border">run {{ o.status.runId or '-' }}</span>
+          {% if o.status.invalidCount %}
+            <span class="badge text-bg-danger">{{ o.status.invalidCount }} invalid</span>
+          {% endif %}
+          {% if o.status.partial %}<span class="badge text-bg-warning">partial</span>{% endif %}
+          <div class="small text-body-secondary text-truncate" title="{{ o.status.reason }}">
+            {{ o.status.progress or '' }}{% if o.status.reason %} &middot; {{ o.status.reason }}{% endif %}</div>
+        </div>
+        <div class="col-xl-3">
+          <div class="d-flex flex-wrap gap-2 align-items-center">
+          {% for f in flags %}
+            <div class="d-flex align-items-center gap-1">
+              <span class="small text-body-secondary">{{ f.name }}</span>
+              {{ flag_control(o, f, lookup(o.spec, f.path)|string) }}
+            </div>
+          {% endfor %}
+          </div>
+        </div>
+        <div class="col-xl-3 text-xl-end text-nowrap">
+          {{ row_actions(o, crd, show_jobs, True) }}
+        </div>
+      </div>
+    </div>
+
+    <div class="card-body border-top pt-2 pb-3">
+      <div class="row g-4">
+        <div class="col-xxl-6">
+          <div class="small fw-semibold text-body-secondary text-uppercase mb-1">Journal</div>
+          <div class="table-responsive">
+          <table class="table table-sm table-borderless mb-0 align-middle">
+            <thead><tr class="small text-body-secondary">
+              <th>#</th><th>Step</th><th>Type</th><th>Outcome</th>
+              <th class="text-end">Measured</th><th class="text-end">Invalid</th>
+              <th class="text-end">Took</th></tr></thead>
+            <tbody class="table-group-divider">
+            {% for e in o.journal %}
+              <tr>
+                <td class="small font-monospace">{{ e.index }}</td>
+                <td class="small font-monospace">{{ e.id }}</td>
+                <td class="small">{{ e.step }}</td>
+                <td>{{ phase_badge(e.outcome, '') }}</td>
+                <td class="text-end font-monospace small">{{ e.measurements if e.measurements is not none else '-' }}</td>
+                <td class="text-end font-monospace small {{ 'text-danger fw-semibold' if e.invalid }}">{{ e.invalid if e.invalid is not none else '-' }}</td>
+                <td class="text-end font-monospace small">{{ e.duration }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="7" class="small text-body-secondary">
+                Nothing has run yet. The plan advances one step per reconcile pass.</td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          </div>
+        </div>
+
+        <div class="col-xxl-6">
+          <div class="small fw-semibold text-body-secondary text-uppercase mb-1">
+            Slowest cases (p95)</div>
+          <div class="table-responsive">
+          <table class="table table-sm table-borderless mb-0 align-middle">
+            <thead><tr class="small text-body-secondary">
+              <th>Case</th><th>Cache</th><th class="text-end">p50</th>
+              <th class="text-end">p95</th><th class="text-end">p99</th>
+              <th class="text-end">Rows</th><th>Engine</th></tr></thead>
+            <tbody class="table-group-divider">
+            {% for r in o.summary[:8] %}
+              <tr>
+                <td class="small font-monospace text-truncate" style="max-width: 16rem">{{ r.case }}</td>
+                <td class="small">{{ r.cache }}</td>
+                <td class="text-end font-monospace small">{{ fmt(r.p50) }}</td>
+                <td class="text-end font-monospace small">{{ fmt(r.p95) }}</td>
+                <td class="text-end font-monospace small">{{ fmt(r.p99) }}</td>
+                <td class="text-end font-monospace small">{{ fmt(r.total if r.total is not none else r.rows) }}</td>
+                <td class="small font-monospace">{{ r.engine }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="7" class="small text-body-secondary">
+                No measurements yet. Percentiles are computed from raw samples
+                once a measure step finishes.</td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          </div>
+        </div>
+      </div>
+      <details class="mt-2"><summary class="small text-body-secondary">spec yaml</summary>
+        <pre class="small mb-0 mt-2">{{ o.yaml }}</pre></details>
+    </div>
+  </div>
+{% else %}
+  <div class="card mb-4"><div class="card-body text-body-secondary">
+    No {{ crd.kind }} objects. Use the form below -- stackRef and datasetRef are
+    mandatory and the plan defaults to cold / prewarm / warm / hot.</div></div>
+{% endfor %}
+
 {% else %}
 {# ------------------------------------------------- every other kind: table #}
 <div class="card mb-4">
@@ -1261,6 +1750,80 @@ PAGE = """
 {% endif %}
 
 </div>
+
+{% if show_benchmark %}
+{# ------------------------------------------------------------- run panel
+   Outside #objects on purpose: the list refreshes itself every ten seconds by
+   replacing that div's contents, which would reset these selects mid-choice.
+
+   Every run is a new object. spec is immutable after admission (C1), so
+   re-running an existing benchmark means incrementing its spec.runId, not
+   editing it -- and a fresh object with a timestamped name is what a button
+   press should produce anyway. #}
+<div class="card mb-4 border-primary">
+  <div class="card-header bg-primary-subtle">
+    Run the whole catalogue
+    <span class="small text-body-secondary">all {{ case_count }} cases, one after
+    another, against one stack and one dataset</span>
+  </div>
+  <div class="card-body">
+  <form method="post" class="row g-3 align-items-end">
+    <input type="hidden" name="action" value="run">
+
+    <div class="col-lg-3">
+      <label class="form-label" for="runStack">FhirStack</label>
+      <select class="form-select font-monospace" id="runStack" name="runStack" required>
+        <option value="">-- pick a stack --</option>
+        {% for s in stacks %}
+          <option value="{{ s.key }}" {{ 'disabled' if not s.ready }}>
+            {{ s.key }}{{ '' if s.ready else '  (' ~ s.note ~ ')' }}</option>
+        {% endfor %}
+      </select>
+      <div class="form-text">Must be Ready. A degraded stack is not measured.</div>
+    </div>
+
+    <div class="col-lg-3">
+      <label class="form-label" for="runDataset">FhirDataset</label>
+      <select class="form-select font-monospace" id="runDataset" name="runDataset" required>
+        <option value="">-- pick a dataset --</option>
+        {% for d in dataset_targets %}
+          <option value="{{ d.key }}" {{ 'disabled' if not d.ready }}>
+            {{ d.key }}{{ '' if d.ready else '  (' ~ d.note ~ ')' }}</option>
+        {% endfor %}
+      </select>
+      <div class="form-text">Must be fully loaded, and in the stack's namespace.</div>
+    </div>
+
+    <div class="col-lg-2">
+      <label class="form-label" for="runRepeats">Repeats</label>
+      <input class="form-control font-monospace" type="number" min="1" step="1"
+             id="runRepeats" name="runRepeats" value="30">
+      <div class="form-text">Measurements per case, after warm-up.</div>
+    </div>
+
+    <div class="col-lg-2">
+      <label class="form-label" for="runName">Name</label>
+      <input class="form-control font-monospace" id="runName" name="runName"
+             placeholder="all-&lt;timestamp&gt;">
+      <div class="form-text">Blank auto-names it.</div>
+    </div>
+
+    <div class="col-lg-2 d-grid">
+      <button class="btn btn-primary btn-lg">Run benchmarks</button>
+    </div>
+
+    <div class="col-12">
+      <div class="form-text mb-0">
+        Runs the plan in order: preflight, restart, settle, cold, prewarm, warm,
+        hot, report. Cases run sequentially at concurrency 1, which is the only
+        setting under which pg_stat_statements can attribute an engine to a case.
+        The stack is restarted and held under an exclusive lease for the duration.
+      </div>
+    </div>
+  </form>
+  </div>
+</div>
+{% endif %}
 
 <div class="card" id="editor">
   <div class="card-header">
@@ -1610,10 +2173,10 @@ LOGS = """
 
 <div class="d-flex justify-content-between align-items-center mb-2">
   <h5 class="mb-0">
-    <a class="text-decoration-none" href="/fhirdatasets">FhirDataset</a>
+    <a class="text-decoration-none" href="/{{ plural|default("fhirdatasets") }}">{{ crd.kind if crd else 'Objects' }}</a>
     <span class="text-body-secondary">/</span>
     <a class="text-decoration-none font-monospace"
-       href="/fhirdatasets/{{ namespace }}/{{ name }}">{{ namespace }}/{{ name }}</a>
+       href="/{{ plural|default("fhirdatasets") }}/{{ namespace }}/{{ name }}">{{ namespace }}/{{ name }}</a>
     <span class="text-body-secondary">/</span> logs
     {% if job %}<span class="badge text-bg-light font-monospace">{{ job }}</span>{% endif %}
   </h5>
@@ -1667,7 +2230,7 @@ LOGS = """
     <button class="btn btn-sm btn-outline-secondary" type="button" id="pause">Pause</button>
     <button class="btn btn-sm btn-outline-secondary" type="button" id="clear">Clear</button>
     <a class="btn btn-sm btn-outline-secondary" id="download"
-       href="/fhirdatasets/{{ namespace }}/{{ name }}/logs/download">Download</a>
+       href="/{{ plural|default("fhirdatasets") }}/{{ namespace }}/{{ name }}/logs/download">Download</a>
   </div>
 </form>
 
@@ -1758,7 +2321,7 @@ function setState(text, kind) {
 
 function connect() {
   if (source) { source.close(); }
-  source = new EventSource('/fhirdatasets/{{ namespace }}/{{ name }}/logs/stream?' + query());
+  source = new EventSource('/{{ plural|default("fhirdatasets") }}/{{ namespace }}/{{ name }}/logs/stream?' + query());
   source.addEventListener('open', function () { setState('streaming', 'primary'); });
   source.addEventListener('line', function (event) { add(JSON.parse(event.data)); });
   source.addEventListener('eof', function (event) {
@@ -1801,8 +2364,336 @@ document.getElementById('clear').addEventListener('click', function () {
   pane.replaceChildren();
 });
 document.getElementById('download').href =
-  '/fhirdatasets/{{ namespace }}/{{ name }}/logs/download?' + query();
+  '/{{ plural|default("fhirdatasets") }}/{{ namespace }}/{{ name }}/logs/download?' + query();
 connect();
 </script>
+</body></html>
+"""
+
+
+BENCHMARK = """
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ name }} - benchmark</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head><body class="bg-body-tertiary">
+
+<nav class="navbar navbar-expand bg-dark" data-bs-theme="dark"><div class="container-fluid">
+  <span class="navbar-brand">FHIR operator</span>
+  <ul class="navbar-nav me-auto">
+  {% for c in crds %}
+    <li class="nav-item"><a class="nav-link {{ 'active' if crd and c.plural == crd.plural }}"
+       href="/{{ c.plural }}">{{ c.kind }}</a></li>
+  {% endfor %}
+  </ul>
+</div></nav>
+
+<main class="container-fluid py-4">
+{% if error %}<div class="alert alert-danger"><pre class="mb-0">{{ error }}</pre></div>{% endif %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h5 class="mb-0">
+    <a class="text-decoration-none" href="/fhirbenchmarks">FhirBenchmark</a>
+    <span class="text-body-secondary">/</span>
+    <span class="font-monospace">{{ namespace }}/{{ name }}</span>
+  </h5>
+  <div class="text-nowrap">
+    <a class="btn btn-sm btn-outline-secondary"
+       href="/fhirbenchmarks/{{ namespace }}/{{ name }}/logs?pod=all">Worker logs</a>
+    <a class="btn btn-sm btn-outline-secondary"
+       href="/fhirbenchmarks/{{ namespace }}/{{ name }}/results.json">results.json</a>
+    <a class="btn btn-sm btn-outline-secondary"
+       href="/fhirbenchmarks?edit={{ namespace }}/{{ name }}#editor">Edit spec</a>
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-md-3"><div class="card h-100"><div class="card-body">
+    <div class="small text-body-secondary text-uppercase">Phase</div>
+    <div class="h5 mb-0">{{ status.phase or '-' }}</div>
+    <div class="small text-body-secondary">{{ status.reason or '' }}</div>
+  </div></div></div>
+  <div class="col-md-3"><div class="card h-100"><div class="card-body">
+    <div class="small text-body-secondary text-uppercase">Progress</div>
+    <div class="h5 mb-0 font-monospace">{{ status.progress or '-' }}</div>
+    <div class="small text-body-secondary">run {{ status.runId or '-' }},
+      step {{ status.currentStepId or '-' }}</div>
+  </div></div></div>
+  <div class="col-md-3"><div class="card h-100"><div class="card-body">
+    <div class="small text-body-secondary text-uppercase">Invalid</div>
+    <div class="h5 mb-0 {{ 'text-danger' if status.invalidCount }}">{{ status.invalidCount or 0 }}</div>
+    <div class="small text-body-secondary">an invalid measurement is never
+      dropped, only excluded from the percentiles</div>
+  </div></div></div>
+  <div class="col-md-3"><div class="card h-100"><div class="card-body">
+    <div class="small text-body-secondary text-uppercase">Catalogue</div>
+    <div class="h6 mb-0 font-monospace">{{ status.catalogueName or '-' }}
+      ({{ status.caseCount or 0 }} cases)</div>
+    <div class="small text-body-secondary font-monospace text-truncate">{{ status.catalogueRevision or '' }}</div>
+  </div></div></div>
+</div>
+
+<div class="row g-3">
+  <div class="col-xl-7">
+    <div class="card mb-3">
+      <div class="card-header">Journal
+        <span class="small text-body-secondary">append-only; the record of the run,
+        not a reflection of live state</span></div>
+      <div class="table-responsive">
+      <table class="table table-sm mb-0 align-middle">
+        <thead><tr class="small"><th>#</th><th>Step</th><th>Type</th><th>Outcome</th>
+          <th class="text-end">Shards</th><th class="text-end">Measured</th>
+          <th class="text-end">Invalid</th><th class="text-end">Read ratio</th>
+          <th>Node</th><th class="text-end">Started</th><th class="text-end">Took</th></tr></thead>
+        <tbody>
+        {% for e in journal %}
+          <tr>
+            <td class="font-monospace small">{{ e.index }}</td>
+            <td class="font-monospace small">{{ e.id }}</td>
+            <td class="small">{{ e.step }}</td>
+            <td class="small">{{ e.outcome }}</td>
+            <td class="text-end font-monospace small">{{ e.shards if e.shards is not none else '-' }}</td>
+            <td class="text-end font-monospace small">{{ e.measurements if e.measurements is not none else '-' }}</td>
+            <td class="text-end font-monospace small {{ 'text-danger fw-semibold' if e.invalid }}">{{ e.invalid if e.invalid is not none else '-' }}</td>
+            <td class="text-end font-monospace small">{{ '%.3f'|format(e.coldReadRatio) if e.coldReadRatio is not none else '-' }}</td>
+            <td class="small font-monospace">{{ e.node or '-' }}</td>
+            <td class="text-end small font-monospace">{{ e.started }}</td>
+            <td class="text-end small font-monospace">{{ e.duration }}</td>
+          </tr>
+          {% if e.reasons or e.detail %}
+          <tr><td></td><td colspan="10">
+            {% for r in e.reasons %}<div class="small text-danger-emphasis font-monospace">{{ r }}</div>{% endfor %}
+            {% if e.detail %}<div class="small text-body-secondary font-monospace">{{ e.detail }}</div>{% endif %}
+          </td></tr>
+          {% endif %}
+        {% else %}
+          <tr><td colspan="11" class="text-body-secondary">Nothing has run yet.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">Matched-pair deltas
+        <span class="small text-body-secondary">same cohort, one term different
+        across the Hibernate Search eligibility boundary</span></div>
+      <div class="table-responsive">
+      <table class="table table-sm mb-0 align-middle">
+        <thead><tr class="small"><th>Pair</th><th>Cache</th>
+          <th class="text-end">Eligible p50</th><th class="text-end">Disqualified p50</th>
+          <th class="text-end">Ratio</th><th>Engines</th></tr></thead>
+        <tbody>
+        {% for d in deltas %}
+          <tr>
+            <td class="font-monospace small">{{ d.pair }}</td>
+            <td class="small">{{ d.cache }}</td>
+            <td class="text-end font-monospace small">{{ fmt(d.eligible) }}</td>
+            <td class="text-end font-monospace small">{{ fmt(d.disqualified) }}</td>
+            <td class="text-end font-monospace small fw-semibold">{{ d.ratio }}x</td>
+            <td class="small font-monospace">{{ d.eligibleEngine }} vs {{ d.disqualifiedEngine }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="6" class="text-body-secondary">
+            No pair has both members measured yet. A half-measured pair is not
+            a delta.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-xl-5">
+    <div class="card mb-3">
+      <div class="card-header">Plan</div>
+      <div class="table-responsive">
+      <table class="table table-sm mb-0 align-middle">
+        <thead><tr class="small"><th>#</th><th>Step</th><th>Type</th><th>Detail</th></tr></thead>
+        <tbody>
+        {% for s in plan %}
+          <tr>
+            <td class="font-monospace small">{{ loop.index0 }}</td>
+            <td class="font-monospace small">{{ s.id }}</td>
+            <td class="small">{{ s.step }}</td>
+            <td class="small font-monospace text-body-secondary">
+              {% if s.components %}{{ s.components|join(', ') }}{% endif %}
+              {% if s.cacheLabel %}cache={{ s.cacheLabel }}{% endif %}
+              {% if s.repeats %} repeats={{ s.repeats }}{% endif %}
+              {% if s.bindingMode %} bind={{ s.bindingMode }}{% endif %}
+              {% if s.relations %}{{ s.relations|length }} relations{% endif %}
+              {% if s.require %}{{ s.require }}{% endif %}
+              {% if s.hapi %}{{ s.hapi }}{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">Bindings
+        <span class="small text-body-secondary">seed {{ status.seed }} -- selectivity
+        is controlled, not accidental</span></div>
+      <div class="table-responsive">
+      <table class="table table-sm mb-0 align-middle">
+        <tbody>
+        {% for key, value in bindings %}
+          <tr><td class="small font-monospace">{{ key }}</td>
+              <td class="small font-monospace text-body-secondary">{{ value }}</td></tr>
+        {% else %}
+          <tr><td class="text-body-secondary small">Not bound yet.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">Jobs and pods</div>
+      <div class="table-responsive">
+      <table class="table table-sm mb-0 align-middle">
+        <thead><tr class="small"><th>Job</th><th>Step</th><th>Phase</th>
+          <th class="text-end">Done</th><th class="text-end">Failed</th>
+          <th class="text-end">Age</th></tr></thead>
+        <tbody>
+        {% for j in jobs %}
+          <tr><td class="font-monospace small">{{ j.name }}</td>
+              <td class="small">{{ j.step }}</td>
+              <td class="small">{{ j.phase }}</td>
+              <td class="text-end font-monospace small">{{ j.completions }}</td>
+              <td class="text-end font-monospace small {{ 'text-danger' if j.failed }}">{{ j.failed }}</td>
+              <td class="text-end font-monospace small">{{ j.age }}</td></tr>
+        {% else %}
+          <tr><td colspan="6" class="text-body-secondary small">No benchmark Jobs.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+      <div class="table-responsive border-top">
+      <table class="table table-sm mb-0 align-middle">
+        <thead><tr class="small"><th>Pod</th><th>Phase</th><th>Node</th>
+          <th class="text-end">Age</th><th></th></tr></thead>
+        <tbody>
+        {% for p in pods %}
+          <tr><td class="font-monospace small">{{ p.name }}</td>
+              <td class="small">{{ p.phase }} {{ p.reason }}</td>
+              <td class="small font-monospace">{{ p.node }}</td>
+              <td class="text-end small font-monospace">{{ p.age }}</td>
+              <td class="text-end small">
+                <a href="/fhirbenchmarks/{{ namespace }}/{{ name }}/logs?pod={{ p.name }}">tail</a></td></tr>
+        {% else %}
+          <tr><td colspan="5" class="text-body-secondary small">No worker pods.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header">Every case
+    <span class="small text-body-secondary">p50/p90/p95/p99 from raw samples,
+    never from histogram buckets</span></div>
+  <div class="table-responsive">
+  <table class="table table-sm table-striped mb-0 align-middle">
+    <thead><tr class="small"><th>Case</th><th>Family</th><th>Cache</th>
+      <th class="text-end">n</th><th class="text-end">invalid</th>
+      <th class="text-end">p50</th><th class="text-end">p90</th>
+      <th class="text-end">p95</th><th class="text-end">p99</th>
+      <th class="text-end">max</th><th class="text-end">page</th>
+      <th class="text-end">total</th><th>Engine</th><th>Declared</th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td class="font-monospace small">{{ r.case }}</td>
+        <td class="small">{{ r.family }}</td>
+        <td class="small">{{ r.cache }}</td>
+        <td class="text-end font-monospace small">{{ r.n }}</td>
+        <td class="text-end font-monospace small {{ 'text-danger fw-semibold' if r.invalid }}">{{ r.invalid }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.p50) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.p90) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.p95) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.p99) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.max) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.rows) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.total) }}</td>
+        <td class="small font-monospace {{ 'text-danger' if r.expected and r.engine != r.expected }}">{{ r.engine }}</td>
+        <td class="small font-monospace text-body-secondary">{{ r.expected or '-' }}</td>
+      </tr>
+      {% if r.reasons %}
+        <tr><td colspan="14">
+          {% for reason in r.reasons %}
+            <div class="small text-danger-emphasis font-monospace">{{ reason }}</div>
+          {% endfor %}
+        </td></tr>
+      {% endif %}
+    {% else %}
+      <tr><td colspan="14" class="text-body-secondary">No measurements yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+</main>
+<script>setTimeout(function () { location.reload(); }, 15000);</script>
+</body></html>
+"""
+
+
+CATALOGUE = """
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>catalogue {{ name }}</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head><body class="bg-body-tertiary">
+
+<nav class="navbar navbar-expand bg-dark" data-bs-theme="dark"><div class="container-fluid">
+  <span class="navbar-brand">FHIR operator</span>
+  <ul class="navbar-nav me-auto">
+  {% for c in crds %}
+    <li class="nav-item"><a class="nav-link" href="/{{ c.plural }}">{{ c.kind }}</a></li>
+  {% endfor %}
+  </ul>
+</div></nav>
+
+<main class="container-fluid py-4">
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h5 class="mb-0">Catalogue <span class="font-monospace">{{ name }}</span>
+    <span class="badge text-bg-secondary rounded-pill">{{ cases|length }}</span></h5>
+  <span class="small font-monospace text-body-secondary">{{ revision }}</span>
+</div>
+
+<div class="card mb-3"><div class="card-body py-2 d-flex flex-wrap gap-2">
+  {% for family, count in families %}
+    <span class="badge text-bg-light border font-monospace">{{ family }} {{ count }}</span>
+  {% endfor %}
+</div></div>
+
+<div class="card">
+  <div class="table-responsive">
+  <table class="table table-sm table-striped mb-0 align-middle">
+    <thead><tr class="small"><th>Case</th><th>Family</th><th>Request</th>
+      <th>Declared engine</th><th>Why</th></tr></thead>
+    <tbody>
+    {% for c in cases %}
+      <tr>
+        <td class="font-monospace small">{{ c.id }}</td>
+        <td class="small">{{ c.family }}</td>
+        <td class="font-monospace small">{{ c.method }} {{ c.path }}{% if c.query %}?{{ c.query }}{% endif %}</td>
+        <td class="small font-monospace">{{ c.expectEngine or '-' }}</td>
+        <td class="small text-body-secondary">{{ c.note }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+</main>
 </body></html>
 """

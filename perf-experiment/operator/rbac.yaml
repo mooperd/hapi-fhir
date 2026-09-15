@@ -50,6 +50,12 @@ rules:
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [roles, rolebindings]
     verbs: [get, list, watch, create, update, patch, delete]
+  # A FhirBenchmark takes an exclusive lease on the FhirStack it measures
+  # (C5): two benchmarks restarting one Postgres would each measure the
+  # other's cache state, and neither number would mean anything.
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
   # pods/log is the UI's live tail; events are what it falls back to for a pod
   # that never started and so has no log at all. Both are read-only.
   - apiGroups: [""]

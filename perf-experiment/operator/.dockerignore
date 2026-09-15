@@ -1,0 +1,19 @@
+# The build context is this directory. Without this it is 114MB, 113MB of
+# which is a committed .venv that the image neither uses nor wants -- its
+# dependencies come from requirements.txt at build time.
+.venv/
+__pycache__/
+*.pyc
+
+# Local tooling, not the operator.
+docker-compose.yml
+*.sh
+test_*.py
+
+# Cluster manifests are applied by deploy.sh, not baked in.
+*-crd.yaml
+crd.yaml
+rbac.yaml
+deployment.yaml
+example-*.yaml
+behemoth-*.yaml

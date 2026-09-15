@@ -1,0 +1,43 @@
+# A FhirBenchmark against an existing FhirStack and a fully loaded FhirDataset.
+#
+#   kubectl apply -n perf-s -f example-benchmark.yaml
+#   kubectl get fhirbenchmarks -n perf-s -w
+#
+# spec.plan is omitted, so the CRD's default cold / prewarm / warm / hot
+# sequence is written onto the object at admission -- read it back with
+# `kubectl get fhirbenchmark cohort-core-a -n perf-s -o yaml` to see exactly
+# what will run. Everything except spec.state and spec.runId is immutable
+# after that: to change the question, create a new object.
+apiVersion: perf.fhir/v1alpha1
+kind: FhirBenchmark
+metadata:
+  name: cohort-core-a
+spec:
+  stackRef: behemoth
+  datasetRef: mimic-1m
+  state: Run
+  runId: 1
+  catalogue:
+    name: cohort-core
+    select:
+      # Start with the matched pairs: same cohort, one term different across
+      # the Hibernate Search eligibility boundary. The delta within a pair is
+      # the measured value of Elasticsearch for that shape.
+      families: [pair]
+  defaults:
+    # Engine attribution reads pg_stat_statements, which is server-global, so
+    # a case that declares expectEngine can only be attributed at concurrency
+    # 1. Raise this and any such case is recorded INVALID by name rather than
+    # quietly accepted.
+    concurrency: 1
+    repeats: 30
+    warmup: 5
+    timeoutSeconds: 120
+    bindingMode: pin
+    tolerance:
+      rowCountPct: 0
+      coldReadRatioFloor: 0.8
+  worker:
+    cpu: 1
+    memory: 2
+    storageGi: 10

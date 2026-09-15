@@ -39,6 +39,7 @@ case "${1:-install}" in
     echo
     echo "Operator removed. CRD and FhirStacks left in place:"
     kubectl get fhirstacks --all-namespaces 2>/dev/null || true
+    kubectl get fhirbenchmarks --all-namespaces 2>/dev/null || true
     echo "  kubectl delete crd fhirstacks.perf.fhir   # deletes every FhirStack and its stack"
     exit 0
     ;;
@@ -57,6 +58,7 @@ echo
 echo "==> CRDs"
 kubectl apply -f "$HERE/crd.yaml"
 kubectl apply -f "$HERE/dataset-crd.yaml"
+kubectl apply -f "$HERE/benchmark-crd.yaml"
 
 echo "==> namespace"
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
@@ -71,7 +73,14 @@ kube create configmap fhir-operator-src \
   --from-file=fhir_operator.py="$HERE/fhir_operator.py" \
   --from-file=ui.py="$HERE/ui.py" \
   --from-file=datasets.py="$HERE/datasets.py" \
+  --from-file=reconciliation.py="$HERE/reconciliation.py" \
+  --from-file=benchmark.py="$HERE/benchmark.py" \
+  --from-file=catalogue.py="$HERE/catalogue.py" \
+  --from-file=binding.py="$HERE/binding.py" \
+  --from-file=control.py="$HERE/control.py" \
+  --from-file=stats.py="$HERE/stats.py" \
   --from-file=loader.py="$HERE/loader.py" \
+  --from-file=runner.py="$HERE/runner.py" \
   --from-file=requirements.txt="$HERE/requirements.txt" \
   --from-file=hapi-fhir-standalone.yaml="$MANIFEST" \
   --dry-run=client -o yaml | kubectl apply -f -
