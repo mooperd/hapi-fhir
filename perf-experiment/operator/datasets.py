@@ -29,6 +29,8 @@ import requests
 import yaml
 from kubernetes import client
 
+import reconciliation
+
 GROUP = "perf.fhir"
 VERSION = "v1alpha1"
 PLURAL = "fhirdatasets"
@@ -391,22 +393,6 @@ def ensure_prometheus(namespace, logger):
 # Reconciliation
 # --------------------------------------------------------------------------
 
-def adopt_to_stack(doc, namespace, stack_name, logger):
-    """Owner reference to the FhirStack, so a stack owns its datasets."""
-    try:
-        stack = _custom().get_namespaced_custom_object(
-            GROUP, VERSION, namespace, STACK_PLURAL, stack_name)
-    except client.ApiException:
-        logger.warning("stack %s/%s not found; dataset will not be owned by it",
-                       namespace, stack_name)
-        return
-    doc.setdefault("metadata", {}).setdefault("ownerReferences", []).append({
-        "apiVersion": "%s/%s" % (GROUP, VERSION), "kind": "FhirStack",
-        "name": stack["metadata"]["name"], "uid": stack["metadata"]["uid"],
-        "blockOwnerDeletion": True, "controller": False,
-    })
-
-
 def running_job(namespace, dataset):
     """The dataset's current job, if any, newest first."""
     jobs = _batch().list_namespaced_job(
@@ -466,17 +452,14 @@ def launch(spec, meta, namespace, name, mode, logger, attempt=0,
 
 @kopf.on.create(GROUP, VERSION, PLURAL, id="own")
 def own(spec, namespace, name, patch, logger, **_):
-    """Attach the dataset to its stack the moment it appears."""
-    stack_name = spec.get("stackRef")
-    if not stack_name:
-        return
-    doc = {"metadata": {}}
-    adopt_to_stack(doc, namespace, stack_name, logger)
-    refs = doc["metadata"].get("ownerReferences")
-    if refs:
-        _custom().patch_namespaced_custom_object(
-            GROUP, VERSION, namespace, PLURAL, name, {"metadata": {"ownerReferences": refs}})
-        logger.info("%s is now owned by FhirStack/%s", name, stack_name)
+    """Mark a new dataset Pending.
+
+    Datasets deliberately carry no ownerReference to their FhirStack. An owner
+    reference with blockOwnerDeletion and a purge finalizer are two mechanisms
+    competing over the same teardown ordering, and the cascade cannot be made
+    to wait for a purge that needs the server the stack is deleting. The
+    stack's own delete handler sequences teardown instead.
+    """
     patch.status["phase"] = "Pending"
 
 
@@ -484,6 +467,19 @@ def own(spec, namespace, name, patch, logger, **_):
 def reconcile(spec, meta, status, namespace, name, patch, logger, **_):
     """Close the gap between what the CR says and what the database holds."""
     patch.status["expected"] = expected(spec)
+
+    # Ahead of the stack gate below, which returns early on precisely the
+    # states this cares about: a loader writing into a server that has gone
+    # produces nothing but failures, and leaving it running was how one job
+    # reached 8397 failures against a deleted stack.
+    steady_facts = reconciliation.observe_dataset_steady(namespace, name, spec)
+    steady = reconciliation.decide(reconciliation.DATASET_STEADY, steady_facts)
+    if steady.action is reconciliation.Action.STOP_JOBS:
+        logger.info("steady %s: %s -- %s", name, steady.case_id, steady.reason)
+        reconciliation.stop_jobs(namespace, steady_facts.load_jobs, logger)
+        patch.status["phase"] = "Waiting"
+        patch.status["reason"] = steady.reason
+        return
 
     # Loading into a stack that is still starting just burns the Job's
     # backoffLimit on connection-refused.
@@ -550,43 +546,44 @@ def reconcile(spec, meta, status, namespace, name, patch, logger, **_):
 
 
 @kopf.on.delete(GROUP, VERSION, PLURAL, id="purge")
-def purge(spec, meta, status, namespace, name, logger, **_):
-    """Take the data with the CR.
+def purge(spec, namespace, name, patch, logger, **_):
+    """Take the data with the CR, in the right order.
 
-    TemporaryError keeps the finalizer; kopf drops it when a deletion handler
-    produces no delay, so a PermanentError here would let the CR vanish and
-    leave its resources behind.
+    Every case, and the reasoning behind each, is in reconciliation.py and in
+    reconciliation-cases-SOW.md. This handler only observes, decides, and acts.
 
-    The purge job has its own fixed name rather than sharing the reconcile
-    attempt counter. Reusing that counter collided with an already-finished
-    delete job, so create returned 409 every pass and the purge never
-    progressed while still holding the finalizer.
+    kopf drops the finalizer the moment a deletion handler produces no delay,
+    so returning is how a dataset is released and a delayed TemporaryError is
+    how it is held. kopf.PermanentError must never reach here: it produces no
+    delay either, so it would release the finalizer and delete the CR with its
+    data still in the database.
     """
-    if not spec.get("purgeOnDelete", True):
-        logger.info("purgeOnDelete=false; leaving %s data in place", name)
+    facts = reconciliation.observe_dataset_teardown(namespace, name, spec)
+    decision = reconciliation.decide(reconciliation.DATASET_TEARDOWN, facts)
+    action = decision.action
+    logger.info("teardown %s: %s -- %s", name, decision.case_id, decision.reason)
+
+    if action is reconciliation.Action.RELEASE:
         return
 
-    observed = (status or {}).get("observed") or {}
-    if observed and not sum(int(observed.get(t, 0)) for t in
-                            ("Patient", "Condition", "Observation")):
-        logger.info("%s already empty", name)
-        return
+    patch.status["phase"] = "Deleting"
+    patch.status["reason"] = "%s: %s" % (decision.case_id, decision.reason)
 
-    purge_name = "%s-purge" % name
-    try:
-        found = _batch().read_namespaced_job(purge_name, namespace)
-    except client.ApiException as exc:
-        if exc.status != 404:
-            raise
-        found = None
+    if action is reconciliation.Action.STOP_JOBS:
+        reconciliation.stop_jobs(namespace, facts.load_jobs, logger)
+        raise kopf.TemporaryError(decision.reason, delay=10)
 
-    if found is None:
-        launch(spec, meta, namespace, name, "delete", logger,
-               job_name=purge_name)
-        raise kopf.TemporaryError("purge job %s started" % purge_name, delay=20)
+    if action is reconciliation.Action.START_PURGE:
+        patch.status["jobName"] = reconciliation.start_purge(namespace, name, spec, logger)
+        raise kopf.TemporaryError(decision.reason, delay=20)
 
-    phase = job_phase(found)
-    if phase == "Complete":
-        logger.info("purge of %s complete", name)
-        return
-    raise kopf.TemporaryError("purge job %s is %s" % (purge_name, phase), delay=20)
+    if action is reconciliation.Action.WAIT:
+        raise kopf.TemporaryError(decision.reason, delay=20)
+
+    if action is reconciliation.Action.FAIL:
+        patch.status["phase"] = "PurgeFailed"
+        logger.error("purge of %s cannot proceed: %s", name, decision.reason)
+        raise kopf.TemporaryError(decision.reason, delay=300)
+
+    raise RuntimeError("teardown case %s produced an action purge() cannot perform: %s"
+                       % (decision.case_id, action))

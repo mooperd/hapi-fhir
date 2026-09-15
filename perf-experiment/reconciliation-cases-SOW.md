@@ -40,18 +40,87 @@ These are binding on the implementation.
   propagates untouched.
 - **No silent paths.** Every decision carries a human-readable reason string that is written
   to both `status.reason` and the operator log. A decision with no reason is a bug.
+- **Never raise `PermanentError`.** In a deletion handler it does not mean "stop" — it
+  releases the finalizer and lets the object be deleted with its data intact. Failure is
+  signalled with a long-delayed `TemporaryError`, or by letting an ordinary exception
+  propagate. See section 3.
 - **No default case.** If no case matches the observed facts, `decide()` raises. An
   unmatched combination is a hole in the table and must be visible as a crash, not absorbed
   by an `else`.
 - **Minimum viable.** This is a benchmarking rig. The skeleton handles the cases below and
   nothing more.
 
-## 3. Deliverable: `perf-experiment/operator/reconciliation.py`
+## 3. Verified kopf semantics
+
+Validated 2026-09-15 against kopf at commit `60d02aef`, read from a comment- and
+docstring-stripped mirror of all 85 files in the `kopf` package. These are the mechanics the
+whole design rests on. They are recorded here so nobody has to re-derive them, and so nobody
+substitutes kopf's documentation for its behaviour.
+
+**Finalizer release is conditioned on delays and nothing else.** `processing.py:342-345`:
+
+    deleted = raw_event['type'] == 'DELETED'
+    if not deleted and deletion_is_ongoing and deletion_is_blocked and not delays:
+        patch.fns.append(functools.partial(finalizers.allow_deletion, finalizer=finalizer))
+
+`delays` comes from `state.delays` (`processing.py:513-514`), which filters on
+`active and not finished` (`progression.py:408-420`). So every handler outcome reduces to
+one question: did it leave a pending delay?
+
+| handler outcome | kopf Outcome | delay | finalizer |
+|---|---|---|---|
+| returns normally | `final=True` (`execution.py:357-358`) | none | **removed — object is deleted** |
+| `TemporaryError(delay=N)` | `final=False` (`execution.py:294`) | N | held |
+| `PermanentError` | `final=True` (`execution.py:303-305`) | none | **removed — object is deleted** |
+| any other exception | `final=False` (`execution.py:337-343`) | 60 | held, `logger.exception` every pass |
+
+Four consequences, each of which the design depends on:
+
+1. **`RELEASE` is just "return from the handler".** No API call is needed to drop the
+   finalizer, and none should be made.
+2. **`PermanentError` is a trapdoor, not a stop.** It is indistinguishable from success as far
+   as the finalizer is concerned. See section 7 for the live bug this already causes.
+3. **An uncaught exception is retried forever with a traceback logged each time.**
+   `@kopf.on.delete` defaults `errors`, `timeout` and `retries` to `None` (`on.py:456-458`),
+   so `ErrorsMode.TEMPORARY` applies with `default_backoff = 60` (`configuration.py:332`) and
+   the give-up branches at `execution.py:245-248` and `276-277` are unreachable. This is
+   exactly the "if it fails, let it fail" behaviour this SOW asks for, and it needs no
+   configuration: the operator log gets the full traceback every 60 seconds and the object
+   stays put. `decide()` raising on an unmatched case inherits this for free.
+4. **There is no hidden give-up anywhere.** A `TemporaryError` loop runs until the facts
+   change or a human intervenes. That is what makes Decision 2 implementable.
+
+**Timers require the finalizer too, and can hold it.** `@kopf.timer` sets
+`requires_finalizer=True` (`on.py:725`, `on.py:778`), so `datasets.reconcile`
+(`datasets.py:483`) and `fhir_operator.readiness` (`fhir_operator.py:295`) each add it
+independently of the delete handlers. When deletion starts, kopf stops timers rather than
+spawning them (`processing.py:407-411`), but the stopping delays join the same `delays` list,
+and for a `TimerHandler` there is no cancellation timeout at all — `daemons.py:242-244` sets
+`backoff = None, timeout = None`. kopf waits indefinitely for an in-flight timer body to
+return. Consequence for this design: a `RELEASE` decision does not release the object until
+the reconcile timer has exited. See section 12.
+
+**`kopf.adopt()` sets `controller: True, blockOwnerDeletion: True`** by default —
+`hierarchies.py:294-311` -> `append_owner_reference` (`hierarchies.py:23-38`) ->
+`build_owner_reference` (`bodies.py:256-260`). This is the source of the ownerReference on
+every Job, ConfigMap and PVC the operator creates, and it is the mechanism Decision 1 removes
+from the dataset-to-stack relationship.
+
+**Retry state survives operator restarts.** It is persisted to the object's annotations via
+the progress storage (`processing.py:465`, `501-502`) — the `kopf.zalando.org/purge`
+annotation observed on the stuck `meow0` dataset. A restart mid-purge resumes rather than
+restarting, which is why section 5.1 needs no case for it.
+
+**The finalizer is only ever added while deletion is not ongoing** (`processing.py:298-301`).
+An object created and deleted before the operator processes its creation never gets one. See
+section 12.
+
+## 4. Deliverable: `perf-experiment/operator/reconciliation.py`
 
 One new file. All reconciliation cases live in it and nowhere else, so the whole decision
 surface can be read top to bottom in a single sitting.
 
-### 3.1 Layout
+### 4.1 Layout
 
     SECTION 1  Vocabulary      Enums: StackState, EndpointState, Action
     SECTION 2  Facts           Three frozen dataclasses, pure data, no clients
@@ -63,7 +132,7 @@ surface can be read top to bottom in a single sitting.
 Sections 1-4 are pure and are the unit-testable core. Section 5 is the only place that talks
 to Kubernetes. Section 6 performs the actions the table selects.
 
-### 3.2 Vocabulary
+### 4.2 Vocabulary
 
     StackState     ABSENT | TERMINATING | NOT_READY | READY
     EndpointState  SERVING | PRESENT_NOT_SERVING | ABSENT
@@ -75,7 +144,7 @@ to Kubernetes. Section 6 performs the actions the table selects.
 declared. They are separate axes because they desync: the CR can be gone while Deployments
 still run, and the CR can read `Ready` while `hapi-fhir` is mid-rollout and not serving.
 
-### 3.3 Case shape
+### 4.3 Case shape
 
     @dataclass(frozen=True)
     class Case:
@@ -88,9 +157,9 @@ A table is an ordered tuple of `Case`. `decide(table, facts)` walks it, returns
 `(case.id, case.action, case.reason(facts))` on the first `when` that returns true, and
 raises `RuntimeError` listing the facts if none do.
 
-## 4. Case tables
+## 5. Case tables
 
-### 4.1 DATASET_TEARDOWN — the dataset CR is Terminating
+### 5.1 DATASET_TEARDOWN — the dataset CR is Terminating
 
 Facts:
 
@@ -151,7 +220,7 @@ the purge Job is only created when it does not exist, so a Failed Job is never r
 `datasets.py:588-592` treats anything that is not `Complete` as a reason to raise
 `TemporaryError` forever. Under this SOW they become an explicit, loud, terminal `FAIL`.
 
-### 4.2 STACK_TEARDOWN — the stack CR is Terminating
+### 5.2 STACK_TEARDOWN — the stack CR is Terminating
 
 Facts:
 
@@ -175,7 +244,7 @@ purge against it. Case 3 issues the deletes, case 4 waits for them, case 5 lets 
 Case 1 keeps the existing `protected` behaviour from `fhir_operator.py:280-291` and is
 checked first because it is the cheapest and most absolute.
 
-### 4.3 DATASET_STEADY — the dataset CR is alive
+### 5.3 DATASET_STEADY — the dataset CR is alive
 
 One case only. This is the skeleton; the existing `decide()` at `datasets.py:187-203` keeps
 its job.
@@ -183,18 +252,28 @@ its job.
 Facts:
 
     stack:     StackState
+    endpoint:  EndpointState
     load_jobs: tuple[str]
 
 | # | id | when | action |
 |---|----|------|--------|
-| 1 | `stack-gone-stop-loading` | `stack in (ABSENT, TERMINATING) and load_jobs` | STOP_JOBS |
+| 1 | `stack-gone-stop-loading` | `stack in (ABSENT, TERMINATING) and endpoint != SERVING and load_jobs` | STOP_JOBS |
 | 2 | `carry-on` | always | PROCEED |
 
 Case 1 is what would have stopped the 8397-and-climbing failure count observed on
 `meow0-1-load-0`: a loader hammering a server that no longer exists. Today
 `datasets.py:495-503` only sets `phase: Waiting` and leaves the Job running.
 
-## 5. Observation (Section 5 of the file)
+Case 1 requires the endpoint fact for the same reason case 3 of section 5.1 does: an adopted
+or hand-installed `hapi-fhir` has no `FhirStack` CR at all — that is the situation `adopt.py`
+exists to retrofit (`adopt.py:134-141`) — and a serving endpoint is still a server. Keying
+only on `StackState` would stop a perfectly healthy loader in every un-adopted namespace.
+
+**Wiring note.** This check must run *before* the existing stack gate at
+`datasets.py:490-503`, not after it. That gate returns early on precisely the states case 1
+cares about (stack missing, stack not Ready), so a check placed after it is unreachable.
+
+## 6. Observation (`reconciliation.py` section 5)
 
 Five functions. Each does one read and returns a fact. None of them catch anything except a
 `404` used as an existence probe.
@@ -219,7 +298,7 @@ moment a purge starts. `jobs_for` splits on the `mode` label and returns both.
 `reconciliation.py` obtains its clients the same way `datasets.py` does — module-level
 `init(dyn)` plus `_batch()` / `_core()` / `_custom()` accessors (`datasets.py:49-63`).
 
-## 6. Effects (Section 6 of the file)
+## 7. Effects (`reconciliation.py` section 6)
 
     stop_jobs(namespace, job_names)
         Delete each Job with propagationPolicy=Background. Errors propagate.
@@ -230,8 +309,9 @@ moment a purge starts. `jobs_for` splits on the `mode` label and returns both.
     delete_datasets(namespace, names)
         Delete each FhirDataset CR. Errors propagate.
 
-`start_purge` must **not** call `launch()` at `datasets.py:437-464`. That path drags two
-things into teardown that have no business there:
+`start_purge` must **not** call `launch()` at `datasets.py:437-464`. This is a correctness
+requirement, not tidiness. That path drags three things into teardown that have no business
+there, and the third is a live bug today:
 
 - `dataset_config()` (`datasets.py:439` -> `datasets.py:115`) performs SNOMED lookups via
   `resolve()` at `datasets.py:70-112`, which raises `kopf.TemporaryError` when the ontology
@@ -240,12 +320,19 @@ things into teardown that have no business there:
   outage can currently block a deletion indefinitely.
 - `launch()` re-applies worker RBAC, the ConfigMap, the results PVC and the whole Prometheus
   stack (`datasets.py:444-451`) on an object that is being deleted.
+- `dataset_config()` calls `_validate()` (`datasets.py:144`), which raises
+  `kopf.PermanentError` (`datasets.py:156`, `datasets.py:160`). Per section 3 that **releases
+  the finalizer**. So today, a dataset whose `spec.shape` asks for codes that `spec.codes`
+  cannot resolve is, on deletion, silently deleted from Kubernetes with all of its data left
+  in the database — via `purge()` -> `launch()` (`datasets.py:584`) -> `dataset_config()`
+  (`datasets.py:439`) -> `_validate()`. This is a pre-existing bug, found by validating this
+  SOW against kopf, and dropping `launch()` from the teardown path is what fixes it.
 
 The delete Job needs `MODE=delete`, `FHIR_BASE_URL`, `DATASET_NAME`, `POD_NAMESPACE`,
 `RESULTS_DIR`, the loader ConfigMap and the results PVC. The ConfigMap and PVC already exist
 by the time a teardown runs; `start_purge` references them and does not re-apply them.
 
-## 7. Call-site changes
+## 8. Call-site changes
 
 Three edits outside the new file. All three shrink.
 
@@ -271,7 +358,7 @@ purge of a dataset that still has data. The delete Job's own count is the only a
 lookup at `datasets.py:490-503`. `STOP_JOBS` stops the loader and returns; `PROCEED` falls
 through to the existing logic unchanged.
 
-## 8. Decisions taken
+## 9. Decisions taken
 
 **Decision 1 — drop the FhirStack ownerReference on datasets.**
 `own()` at `datasets.py:467-480` sets an ownerReference with `blockOwnerDeletion: True`
@@ -286,8 +373,11 @@ at dataset-creation time was never adopted afterwards (`datasets.py:399-402`) �
 `meow0` and `meow0-1` had no owner references at all.
 
 **Decision 2 — no timeout-based give-up.**
-Every RELEASE is justified by an observed fact, never by a clock. A purge that genuinely
-fails against a live server leaves the dataset in Terminating with `status.phase: PurgeFailed`
+Every RELEASE is justified by an observed fact, never by a clock. kopf will not impose one
+either: with the default `timeout=None, retries=None` the give-up branches are unreachable
+(section 3), so a `TemporaryError` loop runs until the facts change or a human intervenes.
+A purge that genuinely fails against a live server leaves the dataset in Terminating with
+`status.phase: PurgeFailed`
 and the reason logged every 300 seconds. That is the honest outcome under "if it fails, let it
 fail": the alternative is a timer that silently orphans data. The escape hatch is explicit and
 human: set `spec.purgeOnDelete: false`, which case 2 turns into an immediate RELEASE. The
@@ -303,9 +393,9 @@ dataset's own namespace (`datasets.py:493-494`) and the endpoint is namespace-de
 (`datasets.py:290-291`), so a cross-namespace reference is not expressible today and the
 skeleton will not invent it.
 
-**Decision 5 — the endpoint gate reads Kubernetes objects, never HTTP.** See section 5.
+**Decision 5 — the endpoint gate reads Kubernetes objects, never HTTP.** See section 6.
 
-## 9. Tests: `perf-experiment/operator/test_reconciliation.py`
+## 10. Tests: `perf-experiment/operator/test_reconciliation.py`
 
 Plain script in the house style — `check(label, cond, detail)`, a `FAILS` list,
 `sys.exit(1 if FAILS else 0)` — matching `test_loader.py` and the client-stubbing pattern in
@@ -325,7 +415,7 @@ Sections 1-4 are pure, so the tests construct `Facts` directly and need no clust
    load_jobs=("meow0-1-load-0",), purge_job=None` must return `load-jobs-running` /
    `STOP_JOBS` — never `START_PURGE`.
 
-## 10. Acceptance criteria
+## 11. Acceptance criteria
 
 1. Deleting a `FhirDataset` whose `FhirStack` and `hapi-fhir` Service are absent completes
    without manual intervention, and the operator log names the reason.
@@ -339,8 +429,10 @@ Sections 1-4 are pure, so the tests construct `Facts` directly and need no clust
 6. `test_reconciliation.py` passes, including the coverage and no-match assertions.
 7. No `except` clause is added anywhere in `reconciliation.py` other than the documented
    `404` existence probes.
+8. No `kopf.PermanentError` is reachable from `purge()` or `guard()`, directly or through
+   anything they call. Verify by inspection of the call graph from both handlers.
 
-## 11. Out of scope
+## 12. Out of scope
 
 Noted, deliberately not fixed in the skeleton:
 
@@ -352,3 +444,18 @@ Noted, deliberately not fixed in the skeleton:
 - No UI changes; the delete button at `ui.py:855-858` stays a plain CR delete, which is
   correct now that ordering lives in the finalizers.
 - No metrics for teardown.
+
+Two gaps found while validating against kopf, both accepted for the skeleton:
+
+- **An in-flight reconcile timer delays teardown regardless of the decision tables.** Timers
+  have no cancellation timeout (section 3), and `reconcile` -> `launch()` ->
+  `dataset_config()` -> `resolve()` makes two SNOMED calls at `ONTOLOGY_TIMEOUT = 120`
+  seconds each (`datasets.py:40`, `86`, `100`). A delete arriving mid-tick is held for up to
+  roughly four minutes before any case is even evaluated. Removing `launch()` from the purge
+  path does not fix this; the real fix is a short HTTP timeout, or moving code resolution off
+  the timer path entirely. Out of scope here, but it is why a teardown can look wedged for a
+  few minutes before the log says anything.
+- **A dataset created and deleted before the operator observes it never purges.** The
+  finalizer is only added while deletion is not ongoing (`processing.py:298-301`), so there
+  is no handler to run and its data stays in the database. Acceptable for a benchmarking rig;
+  recorded so it is not rediscovered as a mystery.

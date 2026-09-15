@@ -7,7 +7,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY fhir_operator.py ui.py datasets.py loader.py /app/
+COPY fhir_operator.py ui.py datasets.py reconciliation.py loader.py /app/
 
 # kopf derives its identity from getpass.getuser(), which raises for a uid
 # with no passwd entry. POD_ID is checked first and skips that path.

@@ -24,6 +24,7 @@ from kubernetes import client, config, dynamic
 # kopf loads this file by path and does not put its directory on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import datasets  # noqa: E402 - needs the path above
+import reconciliation  # noqa: E402 - needs the path above
 import ui  # noqa: E402 - needs the path above
 
 GROUP = "perf.fhir"
@@ -252,6 +253,7 @@ def startup(settings, logger, **_):
     # in a thread here rather than a second container so it shares one
     # ConfigMap, one pip install and one set of credentials.
     datasets.init(dyn)
+    reconciliation.init(dyn)
     ui.start(UI_PORT, dyn)
     logger.info("UI listening on :%d", UI_PORT)
 
@@ -271,25 +273,36 @@ def reconcile(spec, namespace, patch, logger, **_):
 
 @kopf.on.delete(GROUP, VERSION, PLURAL, id="guard")
 def guard(spec, namespace, name, logger, **_):
-    """Refuse to delete a protected stack.
+    """Sequence teardown: datasets first, then the stack that serves them.
 
-    Children carry owner references, so deleting the FhirStack deletes the
-    PVCs with it. kopf holds a finalizer, so raising here blocks the delete
-    until someone sets spec.protected to false on purpose.
+    kopf holds perf.fhir/finalizer for as long as this handler keeps producing
+    a delay, and while it holds, the stack's Deployments are still running --
+    which is exactly the window the datasets need in order to purge against
+    hapi-fhir. Returning releases the finalizer and lets the stack go.
+
+    Every case is in reconciliation.py. kopf.PermanentError must never reach
+    here: it produces no delay, so it would release the finalizer and destroy
+    the server while datasets are still purging against it.
     """
-    if spec.get("protected"):
-        # TemporaryError, not PermanentError. kopf drops the finalizer when a
-        # deletion handler produces no delay, and a permanent failure produces
-        # none -- so PermanentError lets the delete through, which is the
-        # opposite of a guard. A delay keeps the finalizer and the object.
-        #
-        # The delay is also how long clearing spec.protected takes to release
-        # a blocked delete, so keep it short.
-        raise kopf.TemporaryError(
-            "%s/%s is protected and will not be deleted. Set spec.protected=false "
-            "to allow it -- this destroys its PVCs and everything on them."
-            % (namespace, name), delay=60)
-    logger.info("deleting %s/%s; owner references take the stack with it", namespace, name)
+    facts = reconciliation.observe_stack_teardown(namespace, spec)
+    decision = reconciliation.decide(reconciliation.STACK_TEARDOWN, facts)
+    action = decision.action
+    logger.info("teardown %s/%s: %s -- %s", namespace, name, decision.case_id, decision.reason)
+
+    if action is reconciliation.Action.PROCEED:
+        return
+
+    if action is reconciliation.Action.DELETE_DATASETS:
+        reconciliation.delete_datasets(
+            namespace, [dataset for dataset, terminating in facts.datasets if not terminating],
+            logger)
+        raise kopf.TemporaryError(decision.reason, delay=10)
+
+    if action is reconciliation.Action.WAIT:
+        raise kopf.TemporaryError(decision.reason, delay=20)
+
+    raise RuntimeError("stack teardown case %s produced an action guard() cannot perform: %s"
+                       % (decision.case_id, action))
 
 
 @kopf.timer(GROUP, VERSION, PLURAL, interval=15, id="readiness")
