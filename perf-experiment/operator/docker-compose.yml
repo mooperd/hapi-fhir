@@ -6,7 +6,7 @@
 #   docker compose down              stop it
 #
 # The in-cluster Deployment must be scaled to zero while this runs, or two
-# operators reconcile the same objects. ./operator.sh up does both.
+# operators reconcile the same objects. ./fhir.sh dev mode does both.
 services:
   operator:
     build: .
@@ -21,7 +21,7 @@ services:
     volumes:
       # The operator source, straight off the host. The image still COPYs it so
       # the image runs standalone, but this mount wins, so an edit to ui.py or
-      # datasets.py needs only ./operator.sh reload -- no rebuild. datasets.py
+      # datasets.py needs only a compose restart -- no rebuild. datasets.py
       # reads loader.py off this path too, so the loader ConfigMap picks up
       # local edits on the next reconcile.
       - ${OPERATOR_SRC:-.}:/app:ro

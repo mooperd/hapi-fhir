@@ -252,9 +252,16 @@ EXPUNGE_SETTINGS = {
 # minute by default, so on a benchmarking stack every "hot" number would
 # measure the cache and nothing else. Production runs with the cache on; this
 # stack does not, and says so here.
+#
+# filter_search_enabled is true because the catalogue measures _filter. HAPI
+# ships it off (JpaStorageSettings.myFilterParameterEnabled) and rejects the
+# query with HAPI-1222, which the worker records as an error rather than a
+# measurement -- a disabled parameter is indistinguishable from a slow one if
+# nobody turns it on. Note QueryStack parses the expression BEFORE reading this
+# flag, so a syntactically invalid _filter still fails with HAPI-1221 here.
 BENCHMARK_SETTINGS = {
     "reuse_cached_search_results_millis": 0,
-    "filter_search_enabled": False,
+    "filter_search_enabled": True,
 }
 
 
