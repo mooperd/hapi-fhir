@@ -6,10 +6,15 @@
 #   ./deploy.sh              install or update
 #   ./deploy.sh uninstall    remove the operator (leaves CRD and any FhirStacks)
 #   ./deploy.sh logs         follow the operator log
+#   ./deploy.sh ui           port-forward the UI to http://localhost:8085
 #
-# Idempotent: re-run it after editing fhir_operator.py and it will reload the
-# ConfigMap and restart the pod. Override KUBECONFIG or MANIFEST by exporting
-# them first.
+# The operator runs from a container image built by
+# .github/workflows/operator-image.yml and published to ghcr. This script
+# deploys the image for the commit that is checked out right now -- not
+# :latest. A benchmark result has to be able to name the operator that
+# produced it, and a floating tag cannot.
+#
+# Override KUBECONFIG, MANIFEST or OPERATOR_IMAGE_REPO by exporting them first.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,6 +23,8 @@ DOWNLOADER="${DOWNLOADER:-$HOME/Documents/GitHub/mimic-fhir-downloader}"
 KUBECONFIG="${KUBECONFIG:-$DOWNLOADER/behemoth-andrew-test.yaml}"
 MANIFEST="${MANIFEST:-$DOWNLOADER/hapi-fhir-standalone.yaml}"
 NAMESPACE="${NAMESPACE:-fhir-operator}"
+OPERATOR_IMAGE_REPO="${OPERATOR_IMAGE_REPO:-ghcr.io/mooperd/fhir-operator}"
+UI_PORT=8085
 
 export KUBECONFIG
 kube() { kubectl --namespace "$NAMESPACE" "$@"; }
@@ -28,13 +35,18 @@ case "${1:-install}" in
     exec kube logs -l app=fhir-operator --tail=200 --follow
     ;;
 
+  ui)
+    echo "==> http://localhost:$UI_PORT"
+    exec kube port-forward "svc/fhir-operator" "$UI_PORT:$UI_PORT"
+    ;;
+
   uninstall)
     # The CRD and any FhirStacks are left alone on purpose: deleting the CRD
     # deletes every FhirStack, and deleting a FhirStack garbage-collects the
     # HAPI stack underneath it. That is not something to do by accident.
     kubectl delete -f "$HERE/deployment.yaml" --ignore-not-found
     kubectl delete -f "$HERE/rbac.yaml" --ignore-not-found
-    kube delete configmap fhir-operator-src --ignore-not-found
+    kube delete configmap fhir-operator-manifest fhir-operator-src --ignore-not-found
     kubectl delete namespace "$NAMESPACE" --ignore-not-found
     echo
     echo "Operator removed. CRD and FhirStacks left in place:"
@@ -45,14 +57,41 @@ case "${1:-install}" in
     ;;
 
   install) ;;
-  *) echo "usage: $0 [install|uninstall|logs]" >&2; exit 2 ;;
+  *) echo "usage: $0 [install|uninstall|logs|ui]" >&2; exit 2 ;;
 esac
 
 [ -f "$MANIFEST" ] || { echo "manifest not found: $MANIFEST" >&2; exit 1; }
 
+# ---------------------------------------------------------------- the image
+#
+# The tag is the commit, so what runs in the cluster is identifiable.
+
+SHA="$(git -C "$HERE" rev-parse HEAD)"
+IMAGE="$OPERATOR_IMAGE_REPO:sha-$SHA"
+
+# A public ghcr package still needs a pull token, but an anonymous one is
+# enough. A 200 here is the image existing; anything else is the build for
+# this commit not having published yet.
+echo "==> checking $IMAGE"
+REPO_PATH="${OPERATOR_IMAGE_REPO#ghcr.io/}"
+TOKEN="$(curl -fsS "https://ghcr.io/token?scope=repository:$REPO_PATH:pull" \
+         | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Accept: application/vnd.oci.image.index.v1+json" \
+        -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+        "https://ghcr.io/v2/$REPO_PATH/manifests/sha-$SHA")"
+if [ "$CODE" != "200" ]; then
+  echo "refusing to deploy: $IMAGE is not published (HTTP $CODE)." >&2
+  echo "Push the commit and wait for the build:" >&2
+  echo "  https://github.com/mooperd/hapi-fhir/actions/workflows/operator-image.yml" >&2
+  exit 1
+fi
+
 echo "==> cluster:   $(kubectl config current-context)"
 echo "==> kubeconfig $KUBECONFIG"
 echo "==> manifest   $MANIFEST"
+echo "==> image      $IMAGE"
 echo
 
 echo "==> CRDs"
@@ -66,30 +105,21 @@ kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -
 echo "==> rbac"
 kubectl apply -f "$HERE/rbac.yaml"
 
-# The operator reads the manifest at render time, so it has to travel with the
-# source. Both land in the same ConfigMap, mounted read-only at /app.
-echo "==> source + manifest -> configmap"
-kube create configmap fhir-operator-src \
-  --from-file=fhir_operator.py="$HERE/fhir_operator.py" \
-  --from-file=ui.py="$HERE/ui.py" \
-  --from-file=datasets.py="$HERE/datasets.py" \
-  --from-file=reconciliation.py="$HERE/reconciliation.py" \
-  --from-file=benchmark.py="$HERE/benchmark.py" \
-  --from-file=catalogue.py="$HERE/catalogue.py" \
-  --from-file=binding.py="$HERE/binding.py" \
-  --from-file=control.py="$HERE/control.py" \
-  --from-file=stats.py="$HERE/stats.py" \
-  --from-file=loader.py="$HERE/loader.py" \
-  --from-file=runner.py="$HERE/runner.py" \
-  --from-file=requirements.txt="$HERE/requirements.txt" \
+# The Python source is in the image. The stack manifest is not -- it lives in
+# the mimic-fhir-downloader repo and the operator reads it at render time, so
+# it travels as its own small ConfigMap mounted at /manifests.
+echo "==> manifest -> configmap"
+kube create configmap fhir-operator-manifest \
   --from-file=hapi-fhir-standalone.yaml="$MANIFEST" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 echo "==> deployment"
-kubectl apply -f "$HERE/deployment.yaml"
+sed "s|__OPERATOR_IMAGE__|$IMAGE|" "$HERE/deployment.yaml" | kubectl apply -f -
 
-# A ConfigMap change does not restart the pod by itself, and the operator only
-# reads its source at startup.
+# The image tag changes with the commit, so a new commit rolls by itself. The
+# restart is for the case where only the manifest ConfigMap changed -- a
+# ConfigMap edit does not restart the pod, and the operator reads the manifest
+# at startup.
 echo "==> restart"
 kube rollout restart deployment/fhir-operator
 kube rollout status deployment/fhir-operator --timeout=180s
@@ -97,6 +127,8 @@ kube rollout status deployment/fhir-operator --timeout=180s
 echo
 echo "Operator is up. Watching all namespaces."
 echo
-echo "  $HERE/port-forward.sh      then open http://localhost:8085"
+echo "  running $IMAGE"
+echo
+echo "  $0 ui                      then open http://localhost:$UI_PORT"
 echo "  kubectl get fhirstacks -A -w"
 echo "  $0 logs"

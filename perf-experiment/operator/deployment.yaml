@@ -24,57 +24,60 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: operator
-          image: python:3.12-slim
+          # Substituted by deploy.sh with ghcr.io/<owner>/fhir-operator:sha-<commit>.
+          # Pinned to a commit rather than :latest on purpose -- a benchmark
+          # result has to be able to name the operator that produced it, and a
+          # floating tag cannot. This file is not applied directly; deploy.sh
+          # is the entry point.
+          image: __OPERATOR_IMAGE__
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: ["ALL"]}
-          # No image to build or push: dependencies are installed into an
-          # emptyDir at startup. Costs ~20s per restart and needs egress to
-          # PyPI. Swap for a prebuilt image if either becomes a problem.
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -e
-              pip install --quiet --no-cache-dir --target /deps -r /app/requirements.txt
-              exec kopf run /app/fhir_operator.py \
-                --all-namespaces \
-                --standalone \
-                --liveness=http://0.0.0.0:8080/healthz \
-                --verbose
+          # Command and dependencies come from the image. Nothing is installed
+          # at startup, so there is no PyPI egress to have and nothing racing
+          # the liveness probe.
           env:
-            - {name: PYTHONPATH, value: /deps}
-            - {name: PATH, value: "/deps/bin:/usr/local/bin:/usr/bin:/bin"}
             - {name: HOME, value: /tmp}
-            - {name: FHIR_MANIFEST, value: /app/hapi-fhir-standalone.yaml}
+            # The stack manifest is the one input that is not in the image: it
+            # lives in the mimic-fhir-downloader repo and deploy.sh reads it
+            # off disk into a ConfigMap. Same path as the local container, so
+            # there is one layout to reason about.
+            - {name: FHIR_MANIFEST, value: /manifests/hapi-fhir-standalone.yaml}
             # kopf derives its identity from getpass.getuser(), which raises
             # KeyError for uid 65532 because the slim image has no passwd
             # entry for it. POD_ID is checked first and skips that path.
             - name: POD_ID
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - {name: USER, value: fhir-operator}
+          # Same ports the image exposes and the local container uses, so
+          # http://localhost:8085 is the UI whether you are port-forwarding
+          # this or running docker-compose.
           ports:
-            - {name: http, containerPort: 8080}       # kopf liveness
-            - {name: ui, containerPort: 8090}         # flask UI
+            - {name: http, containerPort: 8086}       # kopf liveness
+            - {name: ui, containerPort: 8085}         # flask UI
           livenessProbe:
             httpGet: {path: /healthz, port: http}
-            initialDelaySeconds: 60
             periodSeconds: 20
           readinessProbe:
             httpGet: {path: /healthz, port: ui}
-            initialDelaySeconds: 30
             periodSeconds: 10
+          # The reconciler is up before either probe is allowed to judge it.
+          # Liveness must never race startup: killing a pod that is still
+          # booting produces a crash loop that looks like a broken operator.
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
           resources:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {memory: 512Mi}
           volumeMounts:
-            - {name: app, mountPath: /app, readOnly: true}
-            - {name: deps, mountPath: /deps}
+            - {name: manifests, mountPath: /manifests, readOnly: true}
             - {name: tmp, mountPath: /tmp}
       volumes:
-        - name: app
-          configMap: {name: fhir-operator-src}
-        - {name: deps, emptyDir: {}}
+        - name: manifests
+          configMap: {name: fhir-operator-manifest}
         - {name: tmp, emptyDir: {}}
 ---
 apiVersion: v1
@@ -85,4 +88,4 @@ metadata:
 spec:
   selector: {app: fhir-operator}
   ports:
-    - {name: ui, port: 8090, targetPort: ui}
+    - {name: ui, port: 8085, targetPort: ui}
