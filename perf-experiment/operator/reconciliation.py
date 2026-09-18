@@ -42,7 +42,7 @@ PLURAL = "fhirdatasets"
 STACK_PLURAL = "fhirstacks"
 
 HAPI_SERVICE = "hapi-fhir"
-LOADER_IMAGE = os.environ.get("LOADER_IMAGE", "python:3.12-slim")
+LOADER_IMAGE = os.environ.get("WORKER_IMAGE", "ghcr.io/mooperd/fhir-worker:latest")
 
 # The purge Job's name is fixed rather than attempt-numbered, so a purge that
 # is already running is recognised as the same purge on the next pass.
@@ -474,9 +474,7 @@ def start_purge(namespace, dataset, spec, logger):
                     "containers": [{
                         "name": "worker",
                         "image": LOADER_IMAGE,
-                        "command": ["/bin/sh", "-c"],
-                        "args": ["set -e\npip install --quiet --no-cache-dir --target /deps "
-                                 "-r /config/requirements.txt\nexec python /config/loader.py\n"],
+                        "command": ["python", "/app/loader.py"],
                         "env": [
                             {"name": "MODE", "value": "delete"},
                             {"name": "FHIR_BASE_URL",
@@ -486,7 +484,6 @@ def start_purge(namespace, dataset, spec, logger):
                             {"name": "PARALLELISM", "value": "1"},
                             {"name": "DATASET_NAME", "value": dataset},
                             {"name": "POD_NAMESPACE", "value": namespace},
-                            {"name": "PYTHONPATH", "value": "/deps"},
                             {"name": "HOME", "value": "/tmp"},
                             # A purge polls one type at a time; this is what
                             # keeps status.observed moving across all three
@@ -499,14 +496,14 @@ def start_purge(namespace, dataset, spec, logger):
                         "volumeMounts": [
                             {"name": "config", "mountPath": "/config", "readOnly": True},
                             {"name": "results", "mountPath": "/results"},
-                            {"name": "deps", "mountPath": "/deps"},
                             {"name": "tmp", "mountPath": "/tmp"}],
                     }],
                     "volumes": [
                         {"name": "config", "configMap": {"name": "%s-config" % dataset}},
-                        {"name": "results",
-                         "persistentVolumeClaim": {"claimName": "%s-results" % dataset}},
-                        {"name": "deps", "emptyDir": {}},
+                        # A purge writes a log and no records. It gets no
+                        # upload URL: the pod log is the account of a delete,
+                        # and a teardown must not need GCS to be reachable.
+                        {"name": "results", "emptyDir": {}},
                         {"name": "tmp", "emptyDir": {}}],
                 },
             },

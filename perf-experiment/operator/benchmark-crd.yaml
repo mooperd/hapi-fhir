@@ -232,7 +232,6 @@ spec:
                   properties:
                     cpu: {type: number, default: 1}
                     memory: {type: number, default: 2}
-                    storageGi: {type: integer, default: 10}
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true

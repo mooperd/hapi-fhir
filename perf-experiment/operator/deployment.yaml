@@ -50,6 +50,16 @@ spec:
             - name: POD_ID
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - {name: USER, value: fhir-operator}
+            # GCS. The key mounted below belongs to a bootstrap identity whose
+            # only permission is serviceAccountTokenCreator on the writer; all
+            # storage access comes from impersonating GCS_WRITER_SA, which has
+            # no key anywhere. Signing therefore goes through the IAM signBlob
+            # API here exactly as it does under docker-compose, so both modes
+            # run the same code path.
+            - {name: GOOGLE_APPLICATION_CREDENTIALS, value: /var/secrets/google/key.json}
+            - {name: GCS_BUCKET, value: fhir-benchmark-results}
+            - {name: GCS_PROJECT, value: teak-mantis-509006-s9}
+            - {name: GCS_WRITER_SA, value: __GCS_WRITER_SA__}
           # Same ports the image exposes and the local container uses, so
           # http://localhost:8085 is the UI whether you are port-forwarding
           # this or running docker-compose.
@@ -74,10 +84,16 @@ spec:
             limits: {memory: 512Mi}
           volumeMounts:
             - {name: manifests, mountPath: /manifests, readOnly: true}
+            - {name: gcp, mountPath: /var/secrets/google, readOnly: true}
             - {name: tmp, mountPath: /tmp}
       volumes:
         - name: manifests
           configMap: {name: fhir-operator-manifest}
+        # Created by deploy.sh from a local key file; never committed. The
+        # container root filesystem is read-only, so this is the only place a
+        # credential can live, and it is read-only too.
+        - name: gcp
+          secret: {secretName: fhir-operator-gcp}
         - {name: tmp, emptyDir: {}}
 ---
 apiVersion: v1

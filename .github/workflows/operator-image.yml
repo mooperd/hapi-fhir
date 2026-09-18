@@ -1,13 +1,15 @@
-# Builds the perf-experiment operator image. Nothing else.
+# Created by claude-opus-5
 #
-# This repository is a fork of hapifhir/hapi-fhir and the Java project's own
-# CI was removed with it -- there is no Maven build here, no test run, and no
-# release. The path filter below is what keeps it that way: a commit that does
-# not touch perf-experiment/operator does not start this workflow.
+# Builds the two images the operator needs, worker first.
 #
-# The cluster this image runs on is single-node k3s on linux/amd64, so that is
-# the only platform built. Adding arm64 would double the build for a node that
-# will never pull it.
+# The operator is built with the worker's *digest* as a build arg, so a
+# deployed operator can only ever launch the worker it was built alongside.
+# Nothing resolves a floating tag at run time, and no source is shipped to a
+# pod in a ConfigMap.
+#
+# No GCP credentials are needed here. The operator obtains its own at run time
+# by impersonating the writer service account.
+
 name: operator image
 
 on:
@@ -23,7 +25,8 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/fhir-operator
+  OPERATOR_IMAGE: ghcr.io/${{ github.repository_owner }}/fhir-operator
+  WORKER_IMAGE: ghcr.io/${{ github.repository_owner }}/fhir-worker
 
 jobs:
   build:
@@ -39,20 +42,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: build
+      # Worker first: its digest is an input to the operator build.
+      - id: worker
+        name: build worker
         uses: docker/build-push-action@v6
         with:
           context: perf-experiment/operator
+          target: worker
           platforms: linux/amd64
           push: true
-          # The commit sha is the tag that matters. A benchmark result has to
-          # be able to name the operator that produced it, and `latest` cannot
-          # do that. `latest` is here for convenience only.
           tags: |
-            ${{ env.IMAGE }}:sha-${{ github.sha }}
-            ${{ env.IMAGE }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ${{ env.WORKER_IMAGE }}:sha-${{ github.sha }}
+            ${{ env.WORKER_IMAGE }}:latest
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+
+      - id: build
+        name: build operator
+        uses: docker/build-push-action@v6
+        with:
+          context: perf-experiment/operator
+          target: operator
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            WORKER_IMAGE=${{ env.WORKER_IMAGE }}@${{ steps.worker.outputs.digest }}
+          tags: |
+            ${{ env.OPERATOR_IMAGE }}:sha-${{ github.sha }}
+            ${{ env.OPERATOR_IMAGE }}:latest
+          cache-from: type=gha,scope=operator
+          cache-to: type=gha,mode=max,scope=operator
 
       - name: summary
         run: |
@@ -60,16 +79,23 @@ jobs:
             echo "### Operator image"
             echo
             echo '```'
-            echo "${IMAGE}:sha-${GITHUB_SHA}"
-            echo "${IMAGE}@${DIGEST}"
+            echo "${OPERATOR_IMAGE}:sha-${GITHUB_SHA}"
+            echo "${OPERATOR_IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Workers it will launch, pinned into the operator at build time:"
+            echo
+            echo '```'
+            echo "${WORKER_IMAGE}@${WORKER_DIGEST}"
             echo '```'
             echo
             echo "Deploy the immutable reference:"
             echo
             echo '```sh'
             echo "kubectl -n fhir-operator set image deploy/fhir-operator \\"
-            echo "  operator=${IMAGE}@${DIGEST}"
+            echo "  operator=${OPERATOR_IMAGE}@${DIGEST}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          WORKER_DIGEST: ${{ steps.worker.outputs.digest }}

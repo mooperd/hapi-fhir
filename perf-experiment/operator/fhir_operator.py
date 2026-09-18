@@ -45,7 +45,6 @@ COMPONENTS = {
 }
 
 PG_BASE_GI = 180.0     # the limit the manifest's postgres args were tuned against
-PG_BASE_CPU = 24.0
 
 # PostgreSQL 18. Pinned here rather than taken from the manifest so the version
 # under measurement is a property of the operator that renders the stack, and

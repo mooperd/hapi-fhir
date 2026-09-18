@@ -29,6 +29,8 @@ from kubernetes import client
 
 import catalogue
 import datasets
+import gcs
+import stats
 
 GROUP = "perf.fhir"
 DATASET_PLURAL = "fhirdatasets"
@@ -883,9 +885,13 @@ def journal_rows(status):
     return out
 
 
-def summary_rows(status, full=False):
-    """One row per (case, cache label). Percentiles came from raw samples."""
-    summary = status.get("summaryFull" if full else "summary") or {}
+def summary_rows(summary):
+    """One row per (case, cache label). Percentiles came from raw samples.
+
+    Takes the summary rather than the status: results are read from GCS and
+    nowhere else, so there is no status field left for this to fall back to.
+    """
+    summary = summary or {}
     out = []
     for case_id in sorted(summary):
         for label in sorted(summary[case_id]):
@@ -906,10 +912,14 @@ def summary_rows(status, full=False):
     return out
 
 
-def delta_rows(status):
-    """Matched-pair deltas: the measured value of Elasticsearch, per shape."""
+def delta_rows(summary):
+    """Matched-pair deltas: the measured value of Elasticsearch, per shape.
+
+    Derived on demand. stats.deltas is a pure function of the summary, so
+    storing its output anywhere would only create a copy that can drift.
+    """
     out = []
-    for name, labels in sorted((status.get("deltas") or {}).items()):
+    for name, labels in sorted(stats.deltas(summary or {}).items()):
         for label, entry in sorted(labels.items()):
             out.append({"pair": name, "cache": label,
                         "eligible": entry.get("eligibleP50ms"),
@@ -1007,8 +1017,11 @@ def decorate_benchmarks(found):
         status = obj["status"]
         obj["journal"] = journal_rows(status)
         obj["jobs"] = index.get((obj["namespace"], obj["name"]), [])
-        obj["summary"] = summary_rows(status)
-        obj["deltas"] = delta_rows(status)
+        # No summary or deltas on the index. They live in GCS now, and
+        # rendering a list of n benchmarks would mean n object reads to show
+        # a table nobody reads at a glance. The detail page fetches them.
+        obj["summary"] = []
+        obj["deltas"] = []
         obj["bindings"] = sorted((status.get("bindings") or {}).items())
     return error
 
@@ -1235,14 +1248,25 @@ def benchmark_detail(namespace, name):
     jobs, job_error = benchmark_jobs_for(namespace, name)
     pods, pod_error = pods_for(namespace, name, "fhir-benchmark", "benchmark")
 
+    # The one read of measurements on this page, and it goes to GCS. A run with
+    # no summary object shows an empty table and says so, rather than falling
+    # back to a copy in status -- there is no such copy, by design.
+    summary, summary_error = {}, None
+    run_id = status.get("runId")
+    if run_id:
+        try:
+            summary = gcs.read_summary(namespace, name, int(run_id))
+        except Exception as exc:              # noqa: BLE001 - shown, not hidden
+            summary_error = "results unavailable: %s: %s" % (type(exc).__name__, exc)
+
     return render_template_string(
         BENCHMARK, crds=crds(), crd=crd, namespace=namespace, name=name,
         obj=obj, status=status, spec=(obj or {}).get("spec") or {},
-        journal=journal_rows(status), rows=summary_rows(status, full=True),
-        deltas=delta_rows(status), jobs=jobs, pods=pods, fmt=fmt,
+        journal=journal_rows(status), rows=summary_rows(summary),
+        deltas=delta_rows(summary), jobs=jobs, pods=pods, fmt=fmt,
         bindings=sorted((status.get("bindings") or {}).items()),
         plan=((obj or {}).get("spec") or {}).get("plan") or [],
-        error=error or job_error or pod_error)
+        error=error or job_error or pod_error or summary_error)
 
 
 @app.route("/fhirbenchmarks/<namespace>/<name>/logs")
@@ -1289,8 +1313,11 @@ def benchmark_log_stream(namespace, name):
 
 @app.route("/fhirbenchmarks/<namespace>/<name>/results.json")
 def benchmark_results(namespace, name):
-    """The full summary as JSON. status.summary in the list is the headline
-    only; this is every case at every cache label."""
+    """The whole run as JSON: every case at every cache label.
+
+    The measurements come from the run's summary object in GCS. status supplies
+    provenance and step outcomes only.
+    """
     crd = find(BENCHMARK_PLURAL)
     if crd is None:
         return redirect(url_for("index"))
@@ -1301,21 +1328,78 @@ def benchmark_results(namespace, name):
         return Response("%s %s" % (exc.status, exc.reason), status=exc.status,
                         mimetype="text/plain")
     status = obj.get("status") or {}
+    run_id = status.get("runId")
+    if not run_id:
+        return Response("no run recorded for %s/%s" % (namespace, name),
+                        status=404, mimetype="text/plain")
+    try:
+        summary = gcs.read_summary(namespace, name, int(run_id))
+    except Exception as exc:                  # noqa: BLE001 - named, not hidden
+        return Response("results unavailable from %s: %s: %s"
+                        % (gcs.uri(gcs.summary_path(namespace, name, int(run_id))),
+                           type(exc).__name__, exc),
+                        status=502, mimetype="text/plain")
     body = json.dumps({
         "name": name, "namespace": namespace,
-        "runId": status.get("runId"), "phase": status.get("phase"),
+        "runId": run_id, "phase": status.get("phase"),
         "catalogue": status.get("catalogueName"),
         "catalogueRevision": status.get("catalogueRevision"),
         "bindings": status.get("bindings"),
         "seed": status.get("seed"),
         "journal": status.get("journal"),
-        "summary": status.get("summaryFull"),
-        "deltas": status.get("deltas"),
-        "invalidCount": status.get("invalidCount"),
+        # Read from GCS every time. status holds provenance and step outcomes;
+        # it holds no measurements at all.
+        "summary": summary,
+        "deltas": stats.deltas(summary),
+        # Counted from the summary that was just read, not taken from status.
+        "totals": stats.totals(summary),
+        "resultsUri": status.get("resultsUri"),
+        "runManifestUri": status.get("runManifestUri"),
+        "archive": status.get("archive"),
     }, indent=2)
     return Response(body, mimetype="application/json", headers={
         "Content-Disposition": 'attachment; filename="%s-run%s.json"'
                                % (name, status.get("runId"))})
+
+
+@app.route("/fhirbenchmarks/<namespace>/<name>/objects")
+def benchmark_objects(namespace, name):
+    """Every object a run wrote, each with a short-lived signed read URL.
+
+    The browser talks to GCS directly rather than streaming through here: the
+    ndjson bodies are the largest thing the system produces and proxying them
+    through a Flask worker on a laptop helps nobody.
+    """
+    run_id = request.args.get("run")
+    crd = find(BENCHMARK_PLURAL)
+    if crd is None:
+        return redirect(url_for("index"))
+    if run_id is None:
+        try:
+            obj = _custom().get_namespaced_custom_object(
+                GROUP, crd["version"], namespace, BENCHMARK_PLURAL, name)
+        except client.ApiException as exc:
+            return Response("%s %s" % (exc.status, exc.reason), status=exc.status,
+                            mimetype="text/plain")
+        run_id = (obj.get("status") or {}).get("runId")
+    if not run_id:
+        return Response("no run recorded for %s/%s" % (namespace, name),
+                        status=404, mimetype="text/plain")
+
+    if not gcs.enabled():
+        return Response("GCS is not configured on this operator", status=503,
+                        mimetype="text/plain")
+    prefix = gcs.run_prefix(namespace, name, int(run_id))
+    try:
+        objects = [{"path": path, "uri": gcs.uri(path),
+                    "url": gcs.download_url(path)}
+                   for path in gcs.list_prefix(prefix + "/")]
+    except Exception as exc:                  # noqa: BLE001 - shown, not hidden
+        return Response("%s: %s" % (type(exc).__name__, exc), status=502,
+                        mimetype="text/plain")
+    return Response(json.dumps({"runId": int(run_id), "uri": gcs.uri(prefix),
+                                "objects": objects}, indent=2),
+                    mimetype="application/json")
 
 
 @app.route("/fhirbenchmarks/<namespace>/<name>/logs/download")
@@ -2403,6 +2487,8 @@ BENCHMARK = """
        href="/fhirbenchmarks/{{ namespace }}/{{ name }}/logs?pod=all">Worker logs</a>
     <a class="btn btn-sm btn-outline-secondary"
        href="/fhirbenchmarks/{{ namespace }}/{{ name }}/results.json">results.json</a>
+    <a class="btn btn-sm btn-outline-secondary"
+       href="/fhirbenchmarks/{{ namespace }}/{{ name }}/objects">objects</a>
     <a class="btn btn-sm btn-outline-secondary"
        href="/fhirbenchmarks?edit={{ namespace }}/{{ name }}#editor">Edit spec</a>
   </div>

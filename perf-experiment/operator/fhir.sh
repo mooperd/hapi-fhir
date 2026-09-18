@@ -20,6 +20,14 @@ DOWNLOADER="${DOWNLOADER:-$HOME/Documents/GitHub/mimic-fhir-downloader}"
 KUBECONFIG="${KUBECONFIG:-$DOWNLOADER/behemoth-andrew-test.yaml}"
 export KUBECONFIG KUBECONFIG_PATH="$KUBECONFIG" MANIFEST_DIR="$DOWNLOADER"
 
+# GCS. Dev mode mounts your ADC and impersonates the writer, exactly as the
+# cluster does with its mounted key -- one code path, two base credentials.
+GCLOUD_CONFIG="${GCLOUD_CONFIG:-$HOME/.config/gcloud}"
+GCS_BUCKET="${GCS_BUCKET:-fhir-benchmark-results}"
+GCS_PROJECT="${GCS_PROJECT:-teak-mantis-509006-s9}"
+GCS_WRITER_SA="${GCS_WRITER_SA:-fhir-benchmark-writer@teak-mantis-509006-s9.iam.gserviceaccount.com}"
+export GCLOUD_CONFIG GCS_BUCKET GCS_PROJECT GCS_WRITER_SA
+
 OPNS=fhir-operator
 UI=8085
 PIDS=/tmp/fhir.pids
@@ -100,6 +108,9 @@ go_dev() {
   # cluster copy must still be the one running, not nothing at all.
   [ -S "$HOME/.orbstack/run/docker.sock" ] || [ -S /var/run/docker.sock ] || {
     echo "  docker is not running; start OrbStack first"; sleep 2; return; }
+  [ -f "$GCLOUD_CONFIG/application_default_credentials.json" ] || {
+    echo "  no ADC at $GCLOUD_CONFIG; run: gcloud auth application-default login"
+    sleep 3; return; }
   kill_forwards                                           # frees :8085
   kubectl -n "$OPNS" scale deploy/fhir-operator --replicas=0
   compose up -d --build

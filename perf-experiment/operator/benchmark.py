@@ -31,6 +31,7 @@ import binding
 import catalogue
 import control
 import datasets
+import gcs
 import reconciliation
 import stats
 
@@ -38,8 +39,10 @@ GROUP = "perf.fhir"
 VERSION = "v1alpha1"
 PLURAL = "fhirbenchmarks"
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-WORKER_IMAGE = os.environ.get("LOADER_IMAGE", "python:3.12-slim")
+# Baked into the operator image at build time as an immutable digest, so an
+# operator can only ever launch the worker it was built alongside. Overridable
+# for dev, where the worker is built locally.
+WORKER_IMAGE = os.environ.get("WORKER_IMAGE", "ghcr.io/mooperd/fhir-worker:latest")
 SERVICE_ACCOUNT = "fhir-benchmark"
 
 TERMINAL = ("Complete", "Failed", "Aborted")
@@ -57,11 +60,6 @@ ASSERT_REQUIREMENTS = ("stackReady", "datasetReady", "exclusiveLease",
                        "searchResultCacheDisabled", "analyzedSinceLoad")
 SETTLE_REQUIREMENTS = ("deploymentsReady", "endpointServing")
 
-# Steps a worker Job carries out, because they need a PostgreSQL connection
-# the operator may not have. The rest are pure Kubernetes and run in-process.
-WORKER_STEPS = ("assert", "analyze", "prewarm", "measure")
-OPERATOR_STEPS = ("configure", "restart", "settle", "report")
-
 _dyn = None
 
 
@@ -71,16 +69,8 @@ def init(dyn):
     control.init(dyn)
 
 
-def _core():
-    return client.CoreV1Api(_dyn().client)
-
-
 def _batch():
     return client.BatchV1Api(_dyn().client)
-
-
-def _custom():
-    return client.CustomObjectsApi(_dyn().client)
 
 
 def _now():
@@ -369,7 +359,12 @@ def job_name(name, run_id, step_index):
 
 
 def _worker_rbac(namespace):
-    """Workers publish their own shard results and patch their FhirBenchmark."""
+    """Workers patch their FhirBenchmark. Results go to GCS, not the API server.
+
+    The configmaps grant this Role used to carry is gone with the ConfigMap
+    transport it existed for: a worker now writes to two signed URLs and needs
+    no write access to the cluster at all.
+    """
     return [
         {"apiVersion": "v1", "kind": "ServiceAccount",
          "metadata": {"name": SERVICE_ACCOUNT, "namespace": namespace}},
@@ -377,9 +372,7 @@ def _worker_rbac(namespace):
          "metadata": {"name": SERVICE_ACCOUNT, "namespace": namespace},
          "rules": [
              {"apiGroups": [GROUP], "resources": ["fhirbenchmarks", "fhirbenchmarks/status"],
-              "verbs": ["get", "list", "patch", "update"]},
-             {"apiGroups": [""], "resources": ["configmaps"],
-              "verbs": ["get", "list", "create", "update", "patch"]}]},
+              "verbs": ["get", "list", "patch", "update"]}]},
         {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
          "metadata": {"name": SERVICE_ACCOUNT, "namespace": namespace},
          "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role",
@@ -395,27 +388,37 @@ def _apply(doc, namespace):
                              field_manager="fhir-operator", force_conflicts=True)
 
 
-def _config_map(config_name, step_config):
-    with open(os.path.join(HERE, "runner.py"), encoding="utf-8") as handle:
-        runner = handle.read()
+def _config_secret(config_name, step_config):
+    """A Secret, not a ConfigMap: this now carries the shard's signed URLs.
+
+    They are bearer credentials with a TTL. Nothing about the mount changes;
+    the resource kind is the only difference, and it keeps short-lived write
+    capability out of something people routinely dump with `kubectl get -o
+    yaml`. The worker's code is no longer shipped here at all -- it is in the
+    image, built by CI.
+    """
     return {
-        "apiVersion": "v1", "kind": "ConfigMap",
+        "apiVersion": "v1", "kind": "Secret",
         "metadata": {"name": config_name},
-        "data": {"benchmark.json": json.dumps(step_config), "runner.py": runner,
-                 "requirements.txt": "requests\nprometheus_client\npsycopg[binary]\n"},
+        "type": "Opaque",
+        "stringData": {"benchmark.json": json.dumps(step_config)},
     }
 
 
-def _results_claim(claim_name, size_gi):
+def _shard_urls(namespace, name, run_id, step_index, shard):
+    """The two objects one shard may write, and nothing else."""
+    prefix = gcs.step_prefix(namespace, name, run_id, step_index)
+    body = "%s/shard-%d.ndjson" % (prefix, shard)
+    done = "%s/shard-%d.done.json" % (prefix, shard)
     return {
-        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-        "metadata": {"name": claim_name},
-        "spec": {"accessModes": ["ReadWriteOnce"],
-                 "resources": {"requests": {"storage": "%dGi" % size_gi}}},
+        "shardUrl": gcs.upload_url(body, content_type="application/x-ndjson"),
+        "doneUrl": gcs.upload_url(done, content_type="application/json"),
+        "shardUri": gcs.uri(body),
+        "doneUri": gcs.uri(done),
     }
 
 
-def _job(name, namespace, spec, step, step_index, run_id, config_name, claim_name):
+def _job(name, namespace, spec, step, step_index, run_id, config_name):
     base = defaults_of(spec)
     shards = int(step.get("concurrency", base["concurrency"])) \
         if step["step"] == "measure" else 1
@@ -446,20 +449,23 @@ def _job(name, namespace, spec, step, step_index, run_id, config_name, claim_nam
                     "containers": [{
                         "name": "worker",
                         "image": WORKER_IMAGE,
-                        "command": ["/bin/sh", "-c"],
-                        "args": ["set -e\npip install --quiet --no-cache-dir --target "
-                                 "/deps -r /config/requirements.txt\n"
-                                 "exec python /config/runner.py\n"],
+                        # No shell, no pip, no source from a ConfigMap. The
+                        # image is built by CI and pinned by digest, so the
+                        # code that runs is the code that was reviewed.
+                        "command": ["python", "/app/runner.py"],
                         "env": [
                             {"name": "BENCHMARK_CONFIG", "value": "/config/benchmark.json"},
                             {"name": "FHIR_BASE_URL",
                              "value": "http://hapi-fhir.%s.svc:8080/fhir" % namespace},
+                            # Staging only. The durable copy is the object
+                            # this worker PUTs to its signed URL.
                             {"name": "RESULTS_DIR", "value": "/results"},
                             {"name": "PARALLELISM", "value": str(shards)},
                             {"name": "POD_NAMESPACE", "value": namespace},
                             {"name": "STACK", "value": spec["stackRef"]},
                             {"name": "PG_HOST", "value": "hapi-fhir-db"},
-                            {"name": "PYTHONPATH", "value": "/deps"},
+                            {"name": "ES_BASE_URL",
+                             "value": "http://hapi-fhir-es.%s.svc:9200" % namespace},
                             {"name": "HOME", "value": "/tmp"},
                             {"name": "NODE_NAME",
                              "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}},
@@ -475,14 +481,11 @@ def _job(name, namespace, spec, step, step_index, run_id, config_name, claim_nam
                         "volumeMounts": [
                             {"name": "config", "mountPath": "/config", "readOnly": True},
                             {"name": "results", "mountPath": "/results"},
-                            {"name": "deps", "mountPath": "/deps"},
                             {"name": "tmp", "mountPath": "/tmp"}],
                     }],
                     "volumes": [
-                        {"name": "config", "configMap": {"name": config_name}},
-                        {"name": "results",
-                         "persistentVolumeClaim": {"claimName": claim_name}},
-                        {"name": "deps", "emptyDir": {}},
+                        {"name": "config", "secret": {"secretName": config_name}},
+                        {"name": "results", "emptyDir": {}},
                         {"name": "tmp", "emptyDir": {}}],
                 },
             },
@@ -493,22 +496,29 @@ def _job(name, namespace, spec, step, step_index, run_id, config_name, claim_nam
 def launch(spec, namespace, name, step, step_index, status, logger):
     run_id = int(status.get("runId", 1))
     config_name = "%s-cfg" % job_name(name, run_id, step_index)
-    claim_name = "%s-results" % name
-    worker = spec.get("worker") or {}
+    base = defaults_of(spec)
+    count = int(step.get("concurrency", base["concurrency"])) \
+        if step["step"] == "measure" else 1
 
     for doc in _worker_rbac(namespace):
         _apply(doc, namespace)
     # Same per-namespace Prometheus the loader uses; it keeps pods labelled
     # app=fhir-benchmark as well as app=fhir-loader.
     datasets.ensure_prometheus(namespace, logger)
-    for doc in (_config_map(config_name,
-                            _step_config(spec, step, step_index, name, namespace, status)),
-                _results_claim(claim_name, int(worker.get("storageGi", 10)))):
-        doc["metadata"]["namespace"] = namespace
-        kopf.adopt(doc)
-        _apply(doc, namespace)
 
-    body = _job(name, namespace, spec, step, step_index, run_id, config_name, claim_name)
+    # One signed URL pair per shard, keyed by completion index; a worker takes
+    # its own pair by JOB_COMPLETION_INDEX. The pairs authorise exactly the two
+    # objects this step will produce, and expire -- so even the whole Secret
+    # grants nothing outside this step of this run.
+    config = _step_config(spec, step, step_index, name, namespace, status)
+    config["results"] = {str(i): _shard_urls(namespace, name, run_id, step_index, i)
+                         for i in range(count)}
+    doc = _config_secret(config_name, config)
+    doc["metadata"]["namespace"] = namespace
+    kopf.adopt(doc)
+    _apply(doc, namespace)
+
+    body = _job(name, namespace, spec, step, step_index, run_id, config_name)
     body["metadata"]["namespace"] = namespace
     kopf.adopt(body)
     try:
@@ -530,17 +540,43 @@ def find_job(namespace, name, run_id, step_index):
     return found
 
 
+def markers(namespace, name, run_id, step_index):
+    """The completion markers written so far for one step.
+
+    A marker exists only after its ndjson body was accepted, so counting these
+    is how the operator knows a shard is done. Reading them is cheap; the
+    bodies are not read until every shard has reported.
+    """
+    prefix = gcs.step_prefix(namespace, name, run_id, step_index)
+    return gcs.list_prefix(prefix + "/", suffix=".done.json")
+
+
 def shards(namespace, name, run_id, step_index):
-    """Every published shard result for one step."""
-    selector = "app=fhir-benchmark,benchmark=%s,run=%d,step=%d" % (name, run_id, step_index)
-    found = _core().list_namespaced_config_map(namespace, label_selector=selector).items
+    """Every published shard result for one step, bodies included.
+
+    Shape is unchanged from when this read ConfigMaps: one dict per shard with
+    its records inline, so _ingest and _cold_read_ratio are untouched.
+    """
     out = []
-    for item in found:
-        raw = (item.data or {}).get("result.json")
-        if not raw:
+    for path in markers(namespace, name, run_id, step_index):
+        marker = gcs.read_json(path)
+        body = path[: -len(".done.json")] + ".ndjson"
+        try:
+            records = gcs.read_ndjson(body)
+        except Exception as exc:              # noqa: BLE001 - named, not swallowed
             raise kopf.PermanentError(
-                "shard ConfigMap %s/%s has no result.json" % (namespace, item.metadata.name))
-        out.append(json.loads(raw))
+                "shard marker %s exists but its body %s could not be read (%s: %s). "
+                "The marker is written only after the body is accepted, so this is "
+                "a corrupted result, not an unfinished one"
+                % (gcs.uri(path), gcs.uri(body), type(exc).__name__, exc))
+        declared = marker.get("records")
+        if declared is not None and int(declared) != len(records):
+            raise kopf.PermanentError(
+                "shard %s declares %d records but its body holds %d. A truncated "
+                "result is never folded into a summary"
+                % (gcs.uri(body), int(declared), len(records)))
+        marker["records"] = records
+        out.append(marker)
     return sorted(out, key=lambda s: s["shard"])
 
 
@@ -652,6 +688,19 @@ def _journal(status, entry):
     return journal
 
 
+def _totals(namespace, name, run_id, summary=None):
+    """Run totals, always out of GCS.
+
+    status carries a copy for the CRD's printer columns, but nothing in this
+    operator ever reads that copy back -- it is a projection for `kubectl get`,
+    not a source. Pass summary when the caller already holds it, to save the
+    round trip.
+    """
+    if summary is None:
+        summary = gcs.read_summary(namespace, name, run_id)
+    return stats.totals(summary)
+
+
 def _progress(done, steps, measurements, cases):
     return "%d/%d steps, %d measurements over %d cases" % (done, steps, measurements, cases)
 
@@ -664,6 +713,7 @@ def admit(patch, **_):
     patch.status["journal"] = []
     patch.status["invalidCount"] = 0
     patch.status["measurements"] = 0
+    patch.status["resultsUri"] = ""
 
 
 @kopf.on.resume(GROUP, VERSION, PLURAL, id="no-resume")
@@ -682,6 +732,24 @@ def no_resume(status, patch, name, logger, **_):
         patch.status["partial"] = True
 
 
+# Fields that used to hold measurements in etcd, before results moved to GCS.
+# A FhirBenchmark created by an older operator still carries them, and the UI
+# would happily render a result that no longer has a source of truth behind it.
+LEGACY_RESULT_FIELDS = ("summary", "summaryFull", "deltas")
+
+
+def _strip_legacy(status, patch):
+    """Delete pre-GCS result fields from a status the moment one is seen.
+
+    Setting a key to None is how kopf removes it. This is the only way the old
+    copies ever go away: the runs that wrote them are terminal, so nothing else
+    will ever patch those objects again.
+    """
+    for key in LEGACY_RESULT_FIELDS:
+        if key in (status or {}):
+            patch.status[key] = None
+
+
 @kopf.timer(GROUP, VERSION, PLURAL, interval=15, id="advance")
 def advance(spec, status, namespace, name, patch, logger, **_):
     """One step per pass, and one place a permanent failure can land.
@@ -697,6 +765,7 @@ def advance(spec, status, namespace, name, patch, logger, **_):
     has not converged yet, which is orchestration rather than measurement.
     """
     status = status or {}
+    _strip_legacy(status, patch)
     try:
         _advance(spec, status, namespace, name, patch, logger)
     except kopf.PermanentError as exc:
@@ -734,7 +803,10 @@ def _advance(spec, status, namespace, name, patch, logger):
 
     if decision.action == VALIDATE:
         patch.status["phase"] = "Validating"
-        patch.status.update(validate(spec, namespace, name, logger))
+        validated = validate(spec, namespace, name, logger)
+        patch.status.update(validated)
+        patch.status.update(_open_run(spec, namespace, name, run_id, status,
+                                      validated, logger))
         patch.status["reason"] = "validated"
         return
 
@@ -774,7 +846,8 @@ def _advance(spec, status, namespace, name, patch, logger):
                 patch.status["journal"] = _journal(status, entry)
                 patch.status["reason"] = "settling: %s" % json.dumps(detail)
                 return
-            _close(entry, "Passed", status, patch, spec, index)
+            _close(entry, "Passed", status, patch, spec, index,
+               namespace, name, run_id)
             return
         raise RuntimeError("step %s is Running with nothing to wait on" % step["id"])
 
@@ -786,14 +859,16 @@ def _start(spec, namespace, name, step, index, run_id, entry, status, patch, log
     patch.status["phase"] = "Running"
     patch.status["currentStepId"] = step["id"]
     patch.status["progress"] = _progress(
-        index, len(spec.get("plan") or []), int(status.get("measurements", 0)),
+        index, len(spec.get("plan") or []),
+        _totals(namespace, name, run_id)["measurements"],
         int(status.get("caseCount", 0)))
     kind = step["step"]
 
     if kind == "assert":
         needs_worker = run_assert(spec, namespace, name, step, status, logger)
         if not needs_worker:
-            _close(entry, "Passed", status, patch, spec, index)
+            _close(entry, "Passed", status, patch, spec, index,
+               namespace, name, run_id)
             return
         entry["jobName"] = launch(spec, namespace, name, step, index, status, logger)
 
@@ -804,7 +879,8 @@ def _start(spec, namespace, name, step, index, run_id, entry, status, patch, log
             configured.setdefault(key, was)
         patch.status["configured"] = configured
         entry["before"] = {k: str(v) for k, v in before.items()}
-        _close(entry, "Passed", status, patch, spec, index)
+        _close(entry, "Passed", status, patch, spec, index,
+               namespace, name, run_id)
         return
 
     elif kind == "restart":
@@ -812,18 +888,21 @@ def _start(spec, namespace, name, step, index, run_id, entry, status, patch, log
         if not components:
             raise kopf.PermanentError("restart step %s names no components" % step["id"])
         entry["restartedAt"] = control.restart(namespace, components, logger)
-        _close(entry, "Passed", status, patch, spec, index)
+        _close(entry, "Passed", status, patch, spec, index,
+               namespace, name, run_id)
         return
 
     elif kind == "settle":
         done, detail = run_settle(namespace, step, logger)
         entry["detail"] = detail
         if done:
-            _close(entry, "Passed", status, patch, spec, index)
+            _close(entry, "Passed", status, patch, spec, index,
+               namespace, name, run_id)
             return
 
     elif kind == "report":
-        _close(entry, "Passed", status, patch, spec, index)
+        _close(entry, "Passed", status, patch, spec, index,
+               namespace, name, run_id)
         return
 
     elif kind in ("analyze", "prewarm", "measure"):
@@ -850,16 +929,25 @@ def _ingest(spec, namespace, name, step, index, run_id, entry, status, patch,
         entry["invalidReasons"] = sorted(set(r["invalidReason"] for r in invalid
                                              if r.get("invalidReason")))[:10]
 
+    merged = None
     if records:
         summary = stats.summarise(records)
-        # Folded into the full summary, not the headline: the headline is a
-        # trimmed view recomputed from it, and merging into the trimmed one
-        # would lose every case that was not slow enough last time.
-        merged = stats.merge(dict(status.get("summaryFull") or {}), summary)
-        patch.status["summary"] = stats.headline(merged)
-        patch.status["summaryFull"] = merged
-        patch.status["measurements"] = int(status.get("measurements", 0)) + len(records)
-    patch.status["invalidCount"] = int(status.get("invalidCount", 0)) + len(invalid)
+        # The merge base is read back from GCS, never from status. Results have
+        # exactly one home: a summary that lived in etcd would be a second copy
+        # that could disagree with the object store and could be served without
+        # GCS being reachable at all.
+        merged = stats.merge(gcs.read_summary(namespace, name, run_id), summary)
+        gcs.write_summary(namespace, name, run_id, merged)
+        gcs.write_json("%s/step.json" % gcs.step_prefix(namespace, name, run_id, index),
+                       {"index": index, "id": step["id"], "step": step["step"],
+                        "cacheLabel": step.get("cacheLabel") or step["id"],
+                        "finishedAt": _now(), "summary": summary})
+    # Projections for the CRD's printer columns, recomputed from the GCS
+    # summary every time rather than accumulated in status. Nothing in this
+    # operator reads them back; kubectl is their only consumer.
+    run_totals = _totals(namespace, name, run_id, merged)
+    patch.status["measurements"] = run_totals["measurements"]
+    patch.status["invalidCount"] = run_totals["invalid"]
 
     # Recorded for every measure step whether or not a floor is declared: the
     # hit/read ratio is what makes a cacheLabel a measurement rather than an
@@ -891,7 +979,8 @@ def _ingest(spec, namespace, name, step, index, run_id, entry, status, patch,
               % (step["id"], phase, len(invalid)))
         return
 
-    _close(entry, "Passed", status, patch, spec, index)
+    _close(entry, "Passed", status, patch, spec, index,
+           namespace, name, run_id, totals=merged)
 
 
 def _fail(spec, namespace, name, status, patch, logger, entry, index, reason):
@@ -932,7 +1021,8 @@ def _cold_read_ratio(published):
     return (read / (hit + read)) if (hit + read) else None
 
 
-def _close(entry, outcome, status, patch, spec, index):
+def _close(entry, outcome, status, patch, spec, index,
+           namespace, name, run_id, totals=None):
     entry["outcome"] = outcome
     entry["finishedAt"] = _now()
     patch.status["journal"] = _journal(status, entry)
@@ -940,18 +1030,67 @@ def _close(entry, outcome, status, patch, spec, index):
         patch.status["currentStep"] = index + 1
         patch.status["progress"] = _progress(
             index + 1, len(spec.get("plan") or []),
-            int(patch.status.get("measurements") or status.get("measurements", 0) or 0),
+            _totals(namespace, name, run_id, totals)["measurements"],
             int(status.get("caseCount", 0)))
 
 
+def _open_run(spec, namespace, name, run_id, status, validated, logger):
+    """Write run.json before a single query is issued.
+
+    A run that cannot record its own provenance must not produce numbers, so
+    this is part of validation rather than a best-effort afterthought. It is
+    also the only place the whole context of a run is written down together:
+    catalogue digest, seed, bindings, the HAPI settings in force and the
+    dataset it ran against, next to the records they explain.
+    """
+    gcs.require()
+    prefix = gcs.run_prefix(namespace, name, run_id)
+    manifest = {
+        "name": name, "namespace": namespace, "runId": run_id,
+        "openedAt": _now(),
+        "stackRef": spec.get("stackRef"), "datasetRef": spec.get("datasetRef"),
+        "plan": plan_of(spec),
+        "defaults": defaults_of(spec),
+        "worker": spec.get("worker") or {},
+        "workerImage": WORKER_IMAGE,
+        "hapiSettings": control.hapi_settings(namespace),
+    }
+    manifest.update(validated)
+    uri = gcs.write_json("%s/run.json" % prefix, manifest)
+    logger.info("%s: run %d opened at %s", name, run_id, uri)
+    return {"resultsUri": gcs.uri(prefix), "runManifestUri": uri}
+
+
 def _finish(spec, namespace, name, status, patch, logger):
+    """Close the run. The report points at the summary; it does not copy it.
+
+    Nothing measured is written to status here. deltas are not stored at all --
+    stats.deltas is a pure function of the summary, so the UI derives them on
+    demand rather than keeping a second copy that can drift.
+    """
     patch.status["phase"] = "Reporting"
-    summary = dict(status.get("summaryFull") or {})
-    patch.status["deltas"] = stats.deltas(summary)
-    patch.status["summary"] = stats.headline(summary)
-    outcome = "Failed" if int(status.get("invalidCount", 0)) else "Complete"
+    run_id = int(status.get("runId", 0))
+
+    # Whether the run passed is decided from the records in GCS, not from a
+    # counter in status. A run cannot be declared Complete on the strength of
+    # a number whose evidence the operator did not just read.
+    summary = gcs.read_summary(namespace, name, run_id)
+    run_totals = stats.totals(summary)
+    outcome = "Failed" if run_totals["invalid"] else "Complete"
+    patch.status["measurements"] = run_totals["measurements"]
+    patch.status["invalidCount"] = run_totals["invalid"]
+
+    patch.status["reportUri"] = gcs.write_json(
+        gcs.report_path(namespace, name, run_id),
+        {"name": name, "namespace": namespace, "runId": run_id,
+         "closedAt": _now(), "outcome": outcome,
+         "measurements": run_totals["measurements"],
+         "invalidCount": run_totals["invalid"],
+         "journal": status.get("journal") or [],
+         "summary": gcs.uri(gcs.summary_path(namespace, name, run_id))})
+
     _teardown_run(spec, namespace, name, status, patch, logger, outcome,
-                  "%d measurement(s) invalid" % status.get("invalidCount", 0)
+                  "%d measurement(s) invalid" % run_totals["invalid"]
                   if outcome == "Failed" else "all steps passed")
 
 
@@ -976,22 +1115,26 @@ def _archive(status, patch, spec):
     status.archive, never overwritten."""
     archive = list(status.get("archive") or [])
     if status.get("journal"):
+        # A pointer, not a copy. The summary and journal live in GCS and are
+        # not deleted, so the CR no longer carries five full result sets in
+        # etcd to keep five runs' history.
+        # A pointer and nothing else. The counts for a past run are in its
+        # report.json, next to the records that justify them.
         archive.append({"runId": status.get("runId"), "phase": status.get("phase"),
-                        "journal": status.get("journal"),
-                        "summary": status.get("summaryFull"),
-                        "invalidCount": status.get("invalidCount", 0)})
-    patch.status["archive"] = archive[-5:]
+                        "uri": status.get("resultsUri"),
+                        "report": status.get("reportUri")})
+    patch.status["archive"] = archive[-50:]
     patch.status["runId"] = int(spec.get("runId", 1))
     patch.status["phase"] = "Pending"
     patch.status["currentStep"] = 0
     patch.status["currentStepId"] = ""
     patch.status["journal"] = []
-    patch.status["summary"] = {}
-    patch.status["summaryFull"] = {}
-    patch.status["deltas"] = {}
     patch.status["invalidCount"] = 0
     patch.status["measurements"] = 0
     patch.status["partial"] = False
+    patch.status["resultsUri"] = ""
+    patch.status["runManifestUri"] = ""
+    patch.status["reportUri"] = ""
     patch.status["reason"] = "new run %d" % int(spec.get("runId", 1))
 
 

@@ -11,15 +11,21 @@ success, or best-efforted. A query that times out is recorded as TIMEOUT and
 is never re-issued; a non-2xx is recorded as ERROR with its OperationOutcome
 issue codes and is never excluded from the report.
 
-Output, per shard:
+Output, per shard, to Google Cloud Storage:
 
-    /results/<name>/<runId>/<stepIdx>/shard-<n>.jsonl   every request record
-    ConfigMap bm-<name>-<runId>-<stepIdx>-s<n>          the same, aggregated
+    <ns>/<name>/<runId>/steps/<stepIdx>/shard-<n>.ndjson    every request record
+    <ns>/<name>/<runId>/steps/<stepIdx>/shard-<n>.done.json completion marker
 
-The ConfigMap exists because the results PVC is ReadWriteOnce and the
-operator may be running on a laptop with no route into the cluster. It carries
-the raw latency samples, not bucketed ones: percentiles are computed from raw
-records, never from Prometheus histograms, which are lossy.
+Both are PUT to V4 signed URLs handed down in benchmark.json. This worker
+holds no GCP credential and links no Google library: the URL is the whole
+authorisation, and `requests` is the whole client.
+
+The marker is written last and only after the ndjson body has been accepted,
+so its existence means the records are complete. That is what the operator
+counts to decide a step has finished.
+
+Records carry raw latency samples, not bucketed ones: percentiles are computed
+from raw records, never from Prometheus histograms, which are lossy.
 """
 
 import datetime
@@ -34,13 +40,15 @@ import psycopg
 import requests
 from prometheus_client import Histogram, start_http_server
 
+import upload
+
 CONFIG_PATH = os.environ.get("BENCHMARK_CONFIG", "/config/benchmark.json")
 RESULTS_DIR = os.environ.get("RESULTS_DIR", "/results")
 BASE_URL = os.environ["FHIR_BASE_URL"]
+ES_BASE_URL = os.environ.get("ES_BASE_URL", "")
 INDEX = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
 PARALLELISM = int(os.environ.get("PARALLELISM", "1"))
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
-NAMESPACE = os.environ.get("POD_NAMESPACE", "")
 NODE_NAME = os.environ.get("NODE_NAME", "")
 STACK = os.environ.get("STACK", "")
 
@@ -138,15 +146,47 @@ def pg_delta(before, after):
     return total
 
 
-def attribute(delta):
-    """'postgres' | 'elasticsearch' | None. None is unattributable, which is
-    INVALID for any case that declared an engine -- never resolved by
-    assumption."""
-    if delta["touchedSearchIndex"]:
-        return "postgres"
-    if delta["touchedResourceFetch"]:
-        return "elasticsearch"
-    return None
+def es_query_total(session):
+    """Elasticsearch's own cumulative search counter, or None if unreadable.
+
+    This is the positive witness. PostgreSQL statement activity can only ever
+    say "Postgres did something", and both engines leave PostgreSQL traces: a
+    resource fetch follows an Elasticsearch hit, and _include expansion reads
+    hfj_res_link whichever engine ran the search.
+    """
+    if not ES_BASE_URL:
+        return None
+    try:
+        response = session.get(ES_BASE_URL.rstrip("/") + "/_stats/search", timeout=10)
+        response.raise_for_status()
+        return response.json()["_all"]["total"]["search"]["query_total"]
+    except Exception:
+        return None
+
+
+def attribute(delta, es_delta, requests_issued):
+    """Which engine served the search.
+
+    HAPI has exactly two search paths, so for a request that succeeded this is
+    elimination over a closed set: Elasticsearch counted a query, or it did not
+    and the JPA path ran. delta is no longer consulted for the verdict -- it is
+    kept on the record as evidence, not as the basis of the claim.
+
+    The counter is server-wide, so an unrelated Elasticsearch client can land
+    inside the window. The search result cache is off on a benchmarking stack,
+    so an Elasticsearch-served case issues at least one query on EVERY request:
+    a count below the number of requests means at least one request did not go
+    to Elasticsearch, and the case was served by the JPA path with strays on
+    top. At repeats=30 that tolerates noise for free; at repeats=1 it degrades
+    to the bare "did the counter move" test, which is the best available.
+
+    es_delta is None when the counter could not be read, and then nothing is
+    claimed either: elimination is only sound while the other engine is
+    observable.
+    """
+    if es_delta is None:
+        return None
+    return "elasticsearch" if es_delta >= max(1, requests_issued) else "postgres"
 
 
 # --------------------------------------------------------------------------
@@ -308,12 +348,19 @@ def step_measure(config, conn, records):
     attributable = PARALLELISM == 1
 
     session = requests.Session()
+    if es_query_total(session) is None:
+        return None, fail(
+            "the Elasticsearch search counter at %s cannot be read, so no case can "
+            "be attributed to an engine. PostgreSQL activity alone cannot tell the "
+            "two apart: both engines leave PostgreSQL traces. Set ES_BASE_URL and "
+            "make the service reachable from the worker" % (ES_BASE_URL or "<unset>"))
     print("worker %d: %d of %d cases, %d repeats after %d warmup, attribution %s"
           % (INDEX, len(mine), len(cases), repeats, warmup,
              "on" if attributable else "off (concurrency > 1)"), flush=True)
 
     for case in mine:
         before = pg_snapshot(conn)
+        es_before = es_query_total(session)
         rendered = []
         for rep in range(warmup + repeats):
             bindings = binding_sets[min(rep, len(binding_sets) - 1)]
@@ -360,8 +407,13 @@ def step_measure(config, conn, records):
                            stack=STACK).observe(wall / 1000.0)
 
         delta = pg_delta(before, pg_snapshot(conn))
-        observed = attribute(delta) if attributable else None
-        _reconcile(case, rendered, delta, observed, attributable, tolerance_pct)
+        es_after = es_query_total(session)
+        es_delta = (None if es_before is None or es_after is None
+                    else es_after - es_before)
+        observed = (attribute(delta, es_delta, len(rendered) + warmup)
+                    if attributable else None)
+        _reconcile(case, rendered, delta, observed, attributable, tolerance_pct,
+                   es_delta)
         done = sum(1 for r in rendered if r["valid"])
         print("worker %d: %s %d/%d valid, engine=%s, readRatio=%s"
               % (INDEX, case["id"], done, len(rendered), observed or "-",
@@ -371,7 +423,8 @@ def step_measure(config, conn, records):
     return {"cases": len(mine), "attributable": attributable}, 0
 
 
-def _reconcile(case, rendered, delta, observed, attributable, tolerance_pct):
+def _reconcile(case, rendered, delta, observed, attributable, tolerance_pct,
+               es_delta=None):
     """Apply the validity rules to a case's records, in place.
 
     Every rule here turns a not-exactly-as-declared condition into a named
@@ -389,6 +442,7 @@ def _reconcile(case, rendered, delta, observed, attributable, tolerance_pct):
         record["tempBlksWritten"] = delta["temp_blks_written"]
         record["pgReadRatio"] = delta["readRatio"]
         record["pgTopStatement"] = delta["topStatement"]
+        record["esQueries"] = es_delta
 
         if not record["valid"]:
             continue
@@ -397,15 +451,18 @@ def _reconcile(case, rendered, delta, observed, attributable, tolerance_pct):
             if not attributable:
                 record["valid"] = False
                 record["invalidReason"] = (
-                    "INVALID engine unattributable: case declares expectEngine=%s but "
-                    "pg_stat_statements is server-global and this step ran at "
-                    "concurrency > 1" % expected_engine)
+                    "INVALID engine unattributable: case declares expectEngine=%s "
+                    "but both witnesses are server-global counters and this step "
+                    "ran at concurrency > 1, so no delta belongs to one case"
+                    % expected_engine)
                 continue
             if observed is None:
                 record["valid"] = False
                 record["invalidReason"] = (
-                    "INVALID engine unattributable: no PostgreSQL statement activity "
-                    "during the case, so neither engine can be evidenced")
+                    "INVALID engine unattributable: the Elasticsearch search "
+                    "counter gave no usable verdict for this case -- either it "
+                    "could not be read, or it moved for some but not all of the "
+                    "requests, which a concurrent Elasticsearch client would do")
                 continue
             if observed != expected_engine:
                 record["valid"] = False
@@ -438,67 +495,39 @@ def _reconcile(case, rendered, delta, observed, attributable, tolerance_pct):
 # Reporting
 # --------------------------------------------------------------------------
 
-CONFIGMAP_LIMIT = 900_000
-
-
 def write_shard(config, records, extra):
-    directory = os.path.join(RESULTS_DIR, config["name"], str(config["runId"]),
-                             str(config["stepIndex"]))
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, "shard-%d.jsonl" % INDEX)
+    """Stage the records locally, then PUT the body and its completion marker.
+
+    Local first: the upload crosses the public internet, and a step whose
+    records existed only in memory would lose them to one dropped TCP
+    connection.
+    """
+    results = (config.get("results") or {}).get(str(INDEX)) or {}
+    for key in ("shardUrl", "doneUrl"):
+        if not results.get(key):
+            raise RuntimeError(
+                "benchmark.json carries no results[%d].%s. The operator mints one "
+                "signed URL pair per shard at launch; without it this worker has "
+                "nowhere to report and the step cannot be trusted" % (INDEX, key))
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, "shard-%d.ndjson" % INDEX)
     with open(path, "w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record) + "\n")
-    print("wrote %d records to %s" % (len(records), path), flush=True)
+    print("staged %d records at %s" % (len(records), path), flush=True)
 
-    payload = {"name": config["name"], "runId": config["runId"],
-               "stepIndex": config["stepIndex"], "stepId": config["stepId"],
-               "stepType": config["stepType"], "shard": INDEX, "node": NODE_NAME,
-               "finishedAt": stamp(), "records": records}
-    payload.update(extra or {})
-    body = json.dumps(payload)
-    if len(body) > CONFIGMAP_LIMIT:
-        # Truncating would hand the operator a summary it could not tell from a
-        # complete one. The raw file is on the PVC either way.
-        raise RuntimeError(
-            "shard result is %d bytes, over the %d-byte ConfigMap budget. Lower "
-            "spec.defaults.repeats or narrow spec.catalogue.select"
-            % (len(body), CONFIGMAP_LIMIT))
-    return body
+    upload.put_file(results["shardUrl"], path, upload.NDJSON,
+                    results.get("shardUri") or "shard")
 
-
-def publish(config, body):
-    """POST the shard result to the API server as a ConfigMap.
-
-    The results PVC is ReadWriteOnce and the operator may be outside the
-    cluster, so results are reported inward, exactly as loader.py reports a
-    census inward.
-    """
-    token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-    if not os.path.exists(token_path):
-        raise RuntimeError("no service account token at %s" % token_path)
-    with open(token_path, encoding="utf-8") as handle:
-        token = handle.read().strip()
-    name = "bm-%s-%d-%d-s%d" % (config["name"], config["runId"],
-                                config["stepIndex"], INDEX)
-    doc = {"apiVersion": "v1", "kind": "ConfigMap",
-           "metadata": {"name": name, "namespace": NAMESPACE,
-                        "labels": {"app": "fhir-benchmark",
-                                   "benchmark": config["name"],
-                                   "run": str(config["runId"]),
-                                   "step": str(config["stepIndex"])}},
-           "data": {"result.json": body}}
-    root = "https://kubernetes.default.svc/api/v1/namespaces/%s/configmaps" % NAMESPACE
-    headers = {"Authorization": "Bearer " + token}
-    ca = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-    response = requests.post(root, json=doc, headers=headers, verify=ca, timeout=120)
-    if response.status_code == 409:
-        response = requests.put("%s/%s" % (root, name), json=doc, headers=headers,
-                                verify=ca, timeout=120)
-    if response.status_code >= 300:
-        raise RuntimeError("publishing %s failed: HTTP %d %s"
-                           % (name, response.status_code, (response.text or "")[:800]))
-    print("published %s" % name, flush=True)
+    marker = {"name": config["name"], "runId": config["runId"],
+              "stepIndex": config["stepIndex"], "stepId": config["stepId"],
+              "stepType": config["stepType"], "shard": INDEX, "node": NODE_NAME,
+              "finishedAt": stamp(), "records": len(records),
+              "object": results.get("shardUri")}
+    marker.update(extra or {})
+    upload.put_object(results["doneUrl"], json.dumps(marker).encode("utf-8"),
+                      upload.JSON, results.get("doneUri") or "marker")
 
 
 # --------------------------------------------------------------------------
@@ -553,8 +582,7 @@ def main():
         return fail("%s raised %s: %s" % (step_type, type(exc).__name__, exc))
 
     extra["outcome"] = "Passed" if code == 0 else "Failed"
-    body = write_shard(config, records, extra)
-    publish(config, body)
+    write_shard(config, records, extra)
 
     invalid = sum(1 for r in records if not r["valid"])
     if invalid:

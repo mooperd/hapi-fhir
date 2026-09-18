@@ -40,4 +40,3 @@ spec:
   worker:
     cpu: 1
     memory: 2
-    storageGi: 10

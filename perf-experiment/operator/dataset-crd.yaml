@@ -121,7 +121,6 @@ spec:
                   properties:
                     cpu: {type: number, default: 0.5}
                     memory: {type: number, default: 1}
-                    storageGi: {type: integer, default: 10}
                     censusIntervalSeconds:
                       # How often worker 0 counts what is actually in the
                       # database while a job runs, so status.observed tracks a

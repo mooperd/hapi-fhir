@@ -42,9 +42,25 @@ FAMILIES = (
 # ParamPrefixEnum, all nine (ParamPrefixEnum.java:39-95).
 PREFIXES = ("eq", "ne", "gt", "ge", "lt", "le", "sa", "eb", "ap")
 
-# SearchFilterParser CompareOperation, all eighteen (SearchFilterParser.java:368-393).
+# Read CODES_CompareOperation, NOT the CompareOperation enum. The enum has
+# eighteen members (SearchFilterParser.java:368-387) but the codes list has only
+# fifteen (:35-36), and parsing is CODES_CompareOperation.indexOf(s) ->
+# values()[index]. The last three enum members -- ap, sa, eb -- are therefore
+# unreachable through _filter no matter what the enum says. Counting the enum
+# is what put them here, and it cost three cases that always returned HTTP 400
+# (HAPI-1064) before the server ever looked at filter_search_enabled.
+#
+# pr, po and re are dropped again below the parser: no predicate builder in HAPI
+# implements any of them. po raises HAPI-1255 from DatePredicateBuilder, re
+# raises HAPI-1212 because reference predicates take only eq and ne, and pr has
+# no handler at all -- it degrades to a token search for the literal "true" and
+# returns nothing while still reporting 200, which is worse than an error.
+#
+# ss and sb also have no builder and are served as plain equality. They are kept
+# because they do measure a real token search through the _filter path, but they
+# are not measuring subsumption and the note says so.
 FILTER_OPS = ("eq", "ne", "co", "sw", "ew", "gt", "lt", "ge", "le",
-              "pr", "po", "ss", "sb", "in", "re", "ap", "sa", "eb")
+              "ss", "sb", "in")
 
 
 def case(cid, family, path, query, engine=None, predict=None, method="GET", note=""):
@@ -60,8 +76,6 @@ def case(cid, family, path, query, engine=None, predict=None, method="GET", note
 # recorded but not reconciled, and the case says so rather than pretending.
 COND_COMMON = {"kind": "code", "type": "Condition", "pick": "common"}
 COND_RARE = {"kind": "code", "type": "Condition", "pick": "rare"}
-OBS_COMMON = {"kind": "code", "type": "Observation", "pick": "common"}
-OBS_RARE = {"kind": "code", "type": "Observation", "pick": "rare"}
 
 
 def _token():
@@ -134,10 +148,12 @@ def _date():
         if prefix == "eq":
             continue
         out.append(case("date-%s" % prefix, "date", "/Observation",
-                        "date=%s{{dateMid}}" % prefix, "postgres",
-                        note="ParamPrefixEnum %s; any prefix disqualifies HSearch" % prefix))
+                        "date=%s{{dateMid}}" % prefix, "elasticsearch",
+                        note="ParamPrefixEnum %s. Measured on Elasticsearch: with "
+                             "advanced_lucene_indexing on, HSearch takes prefixed "
+                             "dates" % prefix))
     out.append(case("date-range", "date", "/Observation",
-                    "date=ge{{dateFrom}}&date=le{{dateTo}}", "postgres",
+                    "date=ge{{dateFrom}}&date=le{{dateTo}}", "elasticsearch",
                     note="two-sided window, the shape every longitudinal measure uses"))
     out.append(case("date-lastupdated", "date", "/Condition",
                     "_lastUpdated=gt{{dateFrom}}", None,
@@ -154,11 +170,12 @@ def _quantity():
         if prefix == "eq":
             continue
         out.append(case("quantity-%s" % prefix, "quantity", "/Observation",
-                        "value-quantity=%s{{quantityMid}}" % prefix, "postgres",
-                        note="ParamPrefixEnum %s against a quantity" % prefix))
+                        "value-quantity=%s{{quantityMid}}" % prefix, "elasticsearch",
+                        note="ParamPrefixEnum %s against a quantity; measured on "
+                             "Elasticsearch" % prefix))
     out.append(case("quantity-unit-conversion", "quantity", "/Observation",
                     "value-quantity=gt{{quantityMid}}|http://unitsofmeasure.org|g/dL",
-                    "postgres",
+                    "elasticsearch",
                     note="asks in g/dL for data indexed in mg/dL; hits the "
                          "normalised column rather than the raw one"))
     return out
@@ -190,7 +207,7 @@ def _composite():
              note="the correct form: code and value tied in one indexed fact"),
         case("composite-naive-pair", "composite", "/Observation",
              "code={{snomed}}|{{commonObservationCode}}&value-quantity=gt{{quantityMid}}",
-             "postgres",
+             "elasticsearch",
              note="the form real client code writes. Matches a patient whose "
                   "HbA1c is 6 and whose creatinine is 400; benchmarked because "
                   "it is what is actually deployed"),
@@ -206,11 +223,12 @@ def _reference():
              "subject=Patient/{{heavyPatientId}}", "elasticsearch",
              note="~500 observations, same shape"),
         case("reference-typed", "reference", "/Observation",
-             "subject:Patient={{normalPatientId}}", "postgres",
-             note=":[TargetType] qualifier"),
+             "subject:Patient={{normalPatientId}}", "elasticsearch",
+             note=":[TargetType] qualifier; measured on Elasticsearch"),
         case("reference-identifier", "reference", "/Observation",
-             "subject:identifier=http://perf.fhir/mrn|{{mrn}}", "postgres",
-             note="PARAMQUALIFIER_TOKEN_IDENTIFIER on a reference"),
+             "subject:identifier=http://perf.fhir/mrn|{{mrn}}", "elasticsearch",
+             note="PARAMQUALIFIER_TOKEN_IDENTIFIER on a reference; measured on "
+                  "Elasticsearch"),
         case("reference-mdm", "reference", "/Observation",
              "subject:mdm=Patient/{{normalPatientId}}", "postgres",
              note=":mdm falls through to return false in isParamTypeSupported"),
@@ -247,20 +265,22 @@ def _include():
     return [
         case("include-subject", "include", "/Condition",
              "code={{snomed}}|{{commonConditionCode}}&_include=Condition:subject",
-             "postgres", note="isSupportsAllOf rejects any _include"),
+             "elasticsearch",
+             note="the SEARCH is HSearch-eligible and measured on Elasticsearch; "
+                  "only the _include expansion reads hfj_res_link"),
         case("revinclude-condition", "include", "/Patient",
-             "gender=female&_revinclude=Condition:subject", "postgres",
-             note="isSupportsAllOf rejects any _revinclude"),
+             "gender=female&_revinclude=Condition:subject", "elasticsearch",
+             note="search on Elasticsearch; the _revinclude expansion is SQL"),
         case("include-iterate", "include", "/Condition",
              "code={{snomed}}|{{commonConditionCode}}"
-             "&_include:iterate=Condition:subject", "postgres",
+             "&_include:iterate=Condition:subject", "elasticsearch",
              note="PARAM_INCLUDE_QUALIFIER_ITERATE"),
         case("include-recurse", "include", "/Condition",
              "code={{snomed}}|{{commonConditionCode}}"
-             "&_include:recurse=Condition:subject", "postgres",
+             "&_include:recurse=Condition:subject", "elasticsearch",
              note="PARAM_INCLUDE_QUALIFIER_RECURSE"),
         case("include-wildcard", "include", "/Condition",
-             "code={{snomed}}|{{commonConditionCode}}&_include=*", "postgres",
+             "code={{snomed}}|{{commonConditionCode}}&_include=*", "elasticsearch",
              note="bring everything related -- a loaded gun, measured"),
     ]
 
@@ -295,14 +315,14 @@ def _paging():
     for offset in (0, 13, 503, 2003, 20000):
         out.append(case("paging-offset-%d" % offset, "paging", "/Condition",
                         "code={{snomed}}|{{commonConditionCode}}"
-                        "&_offset=%d&_count=50" % offset, "postgres",
+                        "&_offset=%d&_count=50" % offset, "elasticsearch",
                         note="_offset+_count is isOffsetQuery(): direct LIMIT/OFFSET, "
                              "bypassing the Search cache. Straddles pre-fetch "
                              "threshold boundaries"))
     for count in (10, 50, 200, 1000):
         out.append(case("paging-count-%d" % count, "paging", "/Condition",
                         "code={{snomed}}|{{commonConditionCode}}&_count=%d" % count,
-                        "postgres",
+                        "elasticsearch",
                         note="_count is in ourUnsafeSearchParmeters, so page size "
                              "alone disqualifies HSearch"))
     return out
@@ -323,7 +343,7 @@ def _sort():
              note="QUANTITY is HSearch-sortable"),
         case("sort-family", "sort", "/Patient", "gender=female&_sort=family",
              "elasticsearch", note="STRING is HSearch-sortable"),
-        case("sort-id", "sort", "/Patient", "gender=female&_sort=_id", "postgres",
+        case("sort-id", "sort", "/Patient", "gender=female&_sort=_id", "elasticsearch",
              note="_id is in ourUnsafeSearchParmeters even as a sort key"),
         case("sort-chained", "sort", "/Observation",
              "status=final&_sort=subject.name", "postgres",
@@ -410,19 +430,24 @@ _FILTER_OPERANDS = {
     "co": "code co {{commonConditionCode}}",
     "sw": "code sw {{commonConditionCode}}",
     "ew": "code ew {{commonConditionCode}}",
-    "gt": "recorded-date gt {{dateFrom}}",
-    "lt": "recorded-date lt {{dateTo}}",
-    "ge": "recorded-date ge {{dateFrom}}",
-    "le": "recorded-date le {{dateTo}}",
-    "pr": "code pr true",
-    "po": "recorded-date po {{dateMid}}",
+    # onset-date, not recorded-date. The generator writes onsetDateTime and
+    # leaves recordedDate empty, so recorded-date:missing=true matches all
+    # 189000 Conditions and every date filter on it timed an empty result set
+    # while reporting 200.
+    "gt": "onset-date gt {{dateFrom}}",
+    "lt": "onset-date lt {{dateTo}}",
+    "ge": "onset-date ge {{dateFrom}}",
+    "le": "onset-date le {{dateTo}}",
     "ss": "code ss {{commonConditionCode}}",
     "sb": "code sb {{commonConditionCode}}",
     "in": "code in " + SNOMED + "?fhir_vs=isa/{{commonConditionCode}}",
-    "re": "subject re Patient/{{normalPatientId}}",
-    "ap": "recorded-date ap {{dateMid}}",
-    "sa": "recorded-date sa {{dateFrom}}",
-    "eb": "recorded-date eb {{dateTo}}",
+}
+
+
+_FILTER_NOTES = {
+    "ss": "no subsumption builder exists; HAPI serves ss as plain equality",
+    "sb": "no subsumption builder exists; HAPI serves sb as plain equality",
+    "in": "implicit ValueSet expansion; returns 0 until a CodeSystem is loaded",
 }
 
 
@@ -431,7 +456,7 @@ def _filter():
     for op in FILTER_OPS:
         out.append(case("filter-op-%s" % op, "filter", "/Condition",
                         "_filter=" + _FILTER_OPERANDS[op], "postgres",
-                        note="SearchFilterParser CompareOperation %s" % op))
+                        note=_FILTER_NOTES.get(op, "SearchFilterParser CompareOperation %s" % op)))
     out.extend([
         case("filter-and", "filter", "/Condition",
              "_filter=code eq {{commonConditionCode}} and clinical-status eq active",
@@ -439,9 +464,11 @@ def _filter():
         case("filter-or", "filter", "/Condition",
              "_filter=code eq {{commonConditionCode}} or code eq {{rareConditionCode}}",
              "postgres", note="FilterLogicalOperation or"),
-        case("filter-not", "filter", "/Condition",
-             "_filter=not (code eq {{commonConditionCode}})", "postgres",
-             note="FilterLogicalOperation not"),
+        # No filter-not. FilterLogicalOperation.not exists in the enum but is
+        # unimplemented both ways round: the prefix form "not (A)" reaches
+        # parseLogical(null), which never builds the logical node and fails with
+        # HAPI-1056, and the infix form "A not B" parses and then throws
+        # HAPI-1205 out of QueryStack. There is no spelling of it that runs.
         case("filter-group", "filter", "/Condition",
              "_filter=(code eq {{commonConditionCode}} or code eq {{rareConditionCode}})"
              " and clinical-status eq active", "postgres",
@@ -493,6 +520,21 @@ _PAIRS = (
 )
 
 
+# The disqualified half is not automatically PostgreSQL. With
+# advanced_lucene_indexing on, four of these shapes are still served by
+# Elasticsearch -- _count and a date prefix do not disqualify at all, and for
+# _include/_revinclude only the expansion is SQL while the search itself stays
+# on HSearch. Generating every -b as "postgres" is what made pair-include-b and
+# pair-revinclude-b pass for the wrong reason. Measured 2026-09-17; anything not
+# named here is PostgreSQL.
+_PAIR_B_ENGINE = {
+    "unsafe-count": "elasticsearch",
+    "include": "elasticsearch",
+    "revinclude": "elasticsearch",
+    "date-prefix": "elasticsearch",
+}
+
+
 def _pairs():
     out = []
     for name, path_a, query_a, path_b, query_b, why in _PAIRS:
@@ -501,7 +543,8 @@ def _pairs():
         eligible = None if "_id=" in query_a else "elasticsearch"
         out.append(case("pair-%s-a" % name, "pair", path_a, query_a, eligible,
                         note="eligible member of pair %s" % name))
-        out.append(case("pair-%s-b" % name, "pair", path_b, query_b, "postgres",
+        out.append(case("pair-%s-b" % name, "pair", path_b, query_b,
+                        _PAIR_B_ENGINE.get(name, "postgres"),
                         note="disqualified by: %s" % why))
     return out
 

@@ -29,6 +29,12 @@ services:
       - ${KUBECONFIG_PATH:-${HOME}/Documents/GitHub/mimic-fhir-downloader/behemoth-andrew-test.yaml}:/kube/config:ro
       - ${MANIFEST_DIR:-${HOME}/Documents/GitHub/mimic-fhir-downloader}:/manifests:ro
 
+      # Your gcloud ADC, read-only. It is the base credential the operator
+      # impersonates the writer service account with -- the same shape as the
+      # mounted key in the cluster, so the code path is identical in both
+      # modes. Run `gcloud auth application-default login` if this is missing.
+      - ${GCLOUD_CONFIG:-${HOME}/.config/gcloud}:/gcloud:ro
+
     environment:
       FHIR_UI_PORT: "8085"
       # kopf authenticates from KUBECONFIG; the operator's own client reads
@@ -37,6 +43,15 @@ services:
       FHIR_KUBECONFIG: /kube/config
       FHIR_MANIFEST: /manifests/hapi-fhir-standalone.yaml
       ONTOLOGY_URL: ${ONTOLOGY_URL:-https://ontology-main.bloods.co.uk/api/snomed}
+
+      CLOUDSDK_CONFIG: /gcloud
+      GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+      GCS_BUCKET: ${GCS_BUCKET:-fhir-benchmark-results}
+      GCS_PROJECT: ${GCS_PROJECT:-teak-mantis-509006-s9}
+      GCS_WRITER_SA: ${GCS_WRITER_SA:-fhir-benchmark-writer@teak-mantis-509006-s9.iam.gserviceaccount.com}
+      # Locally built worker by default; CI bakes a digest into the published
+      # operator image instead.
+      WORKER_IMAGE: ${WORKER_IMAGE:-ghcr.io/mooperd/fhir-worker:latest}
 
     healthcheck:
       # kopf's own liveness, not the Flask UI. The UI is a thread inside the

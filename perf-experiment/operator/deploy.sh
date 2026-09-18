@@ -24,6 +24,10 @@ KUBECONFIG="${KUBECONFIG:-$DOWNLOADER/behemoth-andrew-test.yaml}"
 MANIFEST="${MANIFEST:-$DOWNLOADER/hapi-fhir-standalone.yaml}"
 NAMESPACE="${NAMESPACE:-fhir-operator}"
 OPERATOR_IMAGE_REPO="${OPERATOR_IMAGE_REPO:-ghcr.io/mooperd/fhir-operator}"
+# GCS. The key belongs to a bootstrap identity whose only permission is
+# serviceAccountTokenCreator on GCS_WRITER_SA; the writer itself has no key.
+GCP_KEY="${GCP_KEY:-$HOME/.config/gcloud/fhir-operator-key.json}"
+GCS_WRITER_SA="${GCS_WRITER_SA:-fhir-benchmark-writer@teak-mantis-509006-s9.iam.gserviceaccount.com}"
 UI_PORT=8085
 
 export KUBECONFIG
@@ -47,6 +51,7 @@ case "${1:-install}" in
     kubectl delete -f "$HERE/deployment.yaml" --ignore-not-found
     kubectl delete -f "$HERE/rbac.yaml" --ignore-not-found
     kube delete configmap fhir-operator-manifest fhir-operator-src --ignore-not-found
+    kube delete secret fhir-operator-gcp --ignore-not-found
     kubectl delete namespace "$NAMESPACE" --ignore-not-found
     echo
     echo "Operator removed. CRD and FhirStacks left in place:"
@@ -113,8 +118,24 @@ kube create configmap fhir-operator-manifest \
   --from-file=hapi-fhir-standalone.yaml="$MANIFEST" \
   --dry-run=client -o yaml | kubectl apply -f -
 
+# The only long-lived credential in the system. Refusing to deploy without it
+# is deliberate: an operator that starts with no way to write results would
+# fail every run at its first step instead of at install time.
+echo "==> gcp key -> secret"
+[ -f "$GCP_KEY" ] || {
+  echo "refusing to deploy: no service account key at $GCP_KEY" >&2
+  echo "  gcloud iam service-accounts keys create $GCP_KEY \\" >&2
+  echo "    --iam-account fhir-operator@teak-mantis-509006-s9.iam.gserviceaccount.com" >&2
+  exit 1
+}
+kube create secret generic fhir-operator-gcp \
+  --from-file=key.json="$GCP_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
 echo "==> deployment"
-sed "s|__OPERATOR_IMAGE__|$IMAGE|" "$HERE/deployment.yaml" | kubectl apply -f -
+sed -e "s|__OPERATOR_IMAGE__|$IMAGE|" \
+    -e "s|__GCS_WRITER_SA__|$GCS_WRITER_SA|" \
+    "$HERE/deployment.yaml" | kubectl apply -f -
 
 # The image tag changes with the commit, so a new commit rolls by itself. The
 # restart is for the case where only the manifest ConfigMap changed -- a

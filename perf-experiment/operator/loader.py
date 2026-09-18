@@ -26,7 +26,6 @@ Entries are PUT, so a re-run of a finished range is a no-op and the load is
 safely restartable. That is what makes reconciliation cheap.
 """
 
-import csv
 import datetime
 import json
 import os
@@ -39,10 +38,15 @@ import traceback
 import requests
 from prometheus_client import Counter, Histogram, start_http_server
 
+import upload
+
 MODE = os.environ.get("MODE", "load")
 BASE_URL = os.environ["FHIR_BASE_URL"]
 CONFIG_PATH = os.environ.get("DATASET_CONFIG", "/config/dataset.json")
+# Staging only. The durable copy is the ndjson object this worker PUTs to the
+# signed URL the operator minted for it.
 RESULTS_DIR = os.environ.get("RESULTS_DIR", "/results")
+UPLOAD_CONFIG = os.environ.get("UPLOAD_CONFIG", "/uploads/uploads.json")
 INDEX = int(os.environ.get("JOB_COMPLETION_INDEX", "0"))
 PARALLELISM = int(os.environ.get("PARALLELISM", "1"))
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9100"))
@@ -417,19 +421,29 @@ def report(observed, extra=None):
 # Modes
 # --------------------------------------------------------------------------
 
+def upload_target():
+    """This shard's signed upload URL, or None if the operator minted none.
+
+    A purge job gets no URL on purpose, and a dev run against a cluster with
+    no GCS configured still loads data. Absent is absent, not an error.
+    """
+    if not os.path.exists(UPLOAD_CONFIG):
+        return None
+    with open(UPLOAD_CONFIG, encoding="utf-8") as handle:
+        return (json.load(handle) or {}).get(str(INDEX))
+
+
 def run_load(session, config):
     os.makedirs(RESULTS_DIR, exist_ok=True)
     log_path = os.path.join(RESULTS_DIR, "load-%d.log" % INDEX)
-    csv_path = os.path.join(RESULTS_DIR, "load-%d.csv" % INDEX)
+    ndjson_path = os.path.join(RESULTS_DIR, "load-%d.ndjson" % INDEX)
     serials = range(config["first"] + INDEX, config["first"] + config["count"], PARALLELISM)
     headers = {"Content-Type": "application/fhir+json", "Prefer": "return=minimal"}
     started = time.time()
     done = failed = 0
 
     with open(log_path, "a", encoding="utf-8") as log, \
-            open(csv_path, "w", encoding="utf-8", newline="") as raw:
-        out = csv.writer(raw)
-        out.writerow(["serial", "entries", "status", "elapsed_ms", "signature"])
+            open(ndjson_path, "w", encoding="utf-8") as raw:
         failures = Failures(log, "serial")
         progress = Periodic(session, config["datasetName"])
         progress.maybe(force=True)
@@ -452,7 +466,13 @@ def run_load(session, config):
                 signature, detail = explain_exception(exc)
                 failures.record(serial, signature, detail, exc)
             LATENCY.observe(elapsed)
-            out.writerow([serial, entries, status, round(elapsed * 1000), signature])
+            raw.write(json.dumps({
+                "serial": serial, "dataset": config["datasetName"],
+                "shard": INDEX, "at": datetime.datetime.now(
+                    datetime.timezone.utc).isoformat(timespec="milliseconds"),
+                "entries": entries, "status": status,
+                "elapsedMs": round(elapsed * 1000), "signature": signature,
+            }) + "\n")
             if ok:
                 BUNDLES.labels(status="ok").inc()
                 RESOURCES.inc(entries)
@@ -472,6 +492,14 @@ def run_load(session, config):
         print("worker %d load finished: %d done, %d failed in %.0fs"
               % (INDEX, done, failed, time.time() - started), flush=True)
         failures.summary()
+
+    target = upload_target()
+    if target:
+        upload.put_file(target["url"], ndjson_path, upload.NDJSON,
+                        target.get("uri") or ndjson_path)
+    else:
+        print("no upload URL for shard %d; %s stays on the pod only"
+              % (INDEX, ndjson_path), flush=True)
     return failed
 
 

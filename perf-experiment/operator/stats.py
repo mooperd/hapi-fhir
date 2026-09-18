@@ -60,24 +60,27 @@ def summarise(records):
     return out
 
 
+def totals(summary):
+    """Run totals, derived from the summary rather than counted alongside it.
+
+    Every entry is one (case, cacheLabel) group, so attempted sums to the
+    number of records the run produced and invalid to the number that failed
+    validation. Deriving both here means there is no counter to keep in step
+    with the summary, and nothing that can disagree with it.
+    """
+    measurements = invalid = 0
+    for labels in (summary or {}).values():
+        for entry in labels.values():
+            measurements += int(entry.get("attempted") or 0)
+            invalid += int(entry.get("invalid") or 0)
+    return {"measurements": measurements, "invalid": invalid}
+
+
 def merge(into, addition):
     """Fold one step's summary into the run summary. Append-only per label."""
     for case_id, labels in addition.items():
         into.setdefault(case_id, {}).update(labels)
     return into
-
-
-def headline(summary, limit=25):
-    """The slowest cases, for status. The whole summary goes to the PVC."""
-    rows = []
-    for case_id, labels in summary.items():
-        for label, entry in labels.items():
-            rows.append((entry.get("p95ms") or -1, case_id, label))
-    rows.sort(reverse=True)
-    trimmed = {}
-    for _, case_id, label in rows[:limit]:
-        trimmed.setdefault(case_id, {})[label] = summary[case_id][label]
-    return trimmed
 
 
 def deltas(summary):

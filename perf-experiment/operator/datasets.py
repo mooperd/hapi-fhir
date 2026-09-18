@@ -29,6 +29,7 @@ import requests
 import yaml
 from kubernetes import client
 
+import gcs
 import reconciliation
 
 GROUP = "perf.fhir"
@@ -36,11 +37,11 @@ VERSION = "v1alpha1"
 PLURAL = "fhirdatasets"
 STACK_PLURAL = "fhirstacks"
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 ONTOLOGY = os.environ.get("ONTOLOGY_URL", "https://ontology-main.bloods.co.uk/api/snomed")
-LOADER_IMAGE = os.environ.get("LOADER_IMAGE", "python:3.12-slim")
+# One image for every Job this operator launches, pinned by digest at build
+# time. See benchmark.WORKER_IMAGE -- they are deliberately the same variable.
+LOADER_IMAGE = os.environ.get("WORKER_IMAGE", "ghcr.io/mooperd/fhir-worker:latest")
 ONTOLOGY_TIMEOUT = 120
-TAG_SYSTEM = "http://perf.fhir/dataset"
 
 DEFAULT_CONDITION_ROOTS = [{"root": "404684003", "weight": 1}]     # Clinical finding
 DEFAULT_OBSERVATION_ROOTS = [{"root": "363787002", "weight": 1}]   # Observable entity
@@ -55,10 +56,6 @@ def init(dyn):
 
 def _batch():
     return client.BatchV1Api(_dyn().client)
-
-
-def _core():
-    return client.CoreV1Api(_dyn().client)
 
 
 def _custom():
@@ -216,23 +213,36 @@ def _apply(doc, namespace):
 
 
 def config_map(name, config):
-    with open(os.path.join(HERE, "loader.py"), encoding="utf-8") as handle:
-        loader = handle.read()
+    """Still a ConfigMap: control.dataset_config reads dataset.json back out.
+
+    Unlike the benchmark step config this carries no signed URLs -- the
+    loader's log upload URLs are passed separately -- and it is read by the
+    operator as the canonical dataset manifest, so it stays legible.
+    """
     return {
         "apiVersion": "v1", "kind": "ConfigMap",
         "metadata": {"name": name},
-        "data": {"dataset.json": json.dumps(config), "loader.py": loader,
-                 "requirements.txt": "requests\nprometheus_client\n"},
+        "data": {"dataset.json": json.dumps(config)},
     }
 
 
-def results_claim(name, size_gi):
+def log_secret(name, urls):
+    """The loader's signed upload URLs. Bearer credentials, so: a Secret."""
     return {
-        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "apiVersion": "v1", "kind": "Secret",
         "metadata": {"name": name},
-        "spec": {"accessModes": ["ReadWriteOnce"],
-                 "resources": {"requests": {"storage": "%dGi" % size_gi}}},
+        "type": "Opaque",
+        "stringData": {"uploads.json": json.dumps(urls)},
     }
+
+
+def log_urls(namespace, dataset, mode, attempt, parallelism):
+    """One upload URL per loader shard, under the dataset's own prefix."""
+    prefix = "%s/datasets/%s/logs/%s-%d" % (namespace, dataset, mode, attempt)
+    return {str(i): {"url": gcs.upload_url("%s/load-%d.ndjson" % (prefix, i),
+                                           content_type="application/x-ndjson"),
+                     "uri": gcs.uri("%s/load-%d.ndjson" % (prefix, i))}
+            for i in range(parallelism)}
 
 
 def worker_rbac(namespace):
@@ -253,7 +263,7 @@ def worker_rbac(namespace):
     ]
 
 
-def job(job_name, dataset, namespace, spec, mode, config_name, claim_name):
+def job(job_name, dataset, namespace, spec, mode, config_name, uploads_name):
     parallelism = 1 if mode == "delete" else int(spec.get("parallelism", 4))
     loader = spec.get("loader") or {}
     cpu = float(loader.get("cpu", 0.5))
@@ -284,19 +294,19 @@ def job(job_name, dataset, namespace, spec, mode, config_name, claim_name):
                     "containers": [{
                         "name": "worker",
                         "image": LOADER_IMAGE,
-                        "command": ["/bin/sh", "-c"],
-                        "args": ["set -e\npip install --quiet --no-cache-dir --target /deps "
-                                 "-r /config/requirements.txt\nexec python /config/loader.py\n"],
+                        # Built by CI and pinned by digest. No shell, no pip,
+                        # no source shipped in a ConfigMap.
+                        "command": ["python", "/app/loader.py"],
                         "env": [
                             {"name": "MODE", "value": mode},
                             {"name": "FHIR_BASE_URL",
                              "value": "http://hapi-fhir.%s.svc:8080/fhir" % namespace},
                             {"name": "DATASET_CONFIG", "value": "/config/dataset.json"},
                             {"name": "RESULTS_DIR", "value": "/results/%s" % dataset},
+                            {"name": "UPLOAD_CONFIG", "value": "/uploads/uploads.json"},
                             {"name": "PARALLELISM", "value": str(parallelism)},
                             {"name": "DATASET_NAME", "value": dataset},
                             {"name": "POD_NAMESPACE", "value": namespace},
-                            {"name": "PYTHONPATH", "value": "/deps"},
                             {"name": "HOME", "value": "/tmp"},
                             {"name": "STACK", "value": stack},
                             {"name": "CENSUS_INTERVAL_SECONDS",
@@ -309,15 +319,15 @@ def job(job_name, dataset, namespace, spec, mode, config_name, claim_name):
                             "limits": {"memory": "%dMi" % round(memory * 2048)}},
                         "volumeMounts": [
                             {"name": "config", "mountPath": "/config", "readOnly": True},
+                            {"name": "uploads", "mountPath": "/uploads", "readOnly": True},
                             {"name": "results", "mountPath": "/results"},
-                            {"name": "deps", "mountPath": "/deps"},
                             {"name": "tmp", "mountPath": "/tmp"}],
                     }],
                     "volumes": [
                         {"name": "config", "configMap": {"name": config_name}},
-                        {"name": "results",
-                         "persistentVolumeClaim": {"claimName": claim_name}},
-                        {"name": "deps", "emptyDir": {}},
+                        {"name": "uploads", "secret": {"secretName": uploads_name}},
+                        # Staging only; the durable log is the GCS object.
+                        {"name": "results", "emptyDir": {}},
                         {"name": "tmp", "emptyDir": {}}],
                 },
             },
@@ -428,21 +438,22 @@ def _job_name(name, mode, attempt):
 def launch(spec, meta, namespace, name, mode, logger, attempt=0,
            job_name=None):
     config, notes = dataset_config(spec, name, logger)
-    loader = spec.get("loader") or {}
     config_name = "%s-config" % name
-    claim_name = "%s-results" % name
+    uploads_name = "%s-uploads" % name
+    parallelism = 1 if mode == "delete" else int(spec.get("parallelism", 4))
 
     for doc in worker_rbac(namespace):
         _apply(doc, namespace)
     for doc in (config_map(config_name, config),
-                results_claim(claim_name, int(loader.get("storageGi", 10)))):
+                log_secret(uploads_name,
+                           log_urls(namespace, name, mode, attempt, parallelism))):
         doc["metadata"]["namespace"] = namespace
         kopf.adopt(doc)
         _apply(doc, namespace)
     ensure_prometheus(namespace, logger)
 
     job_name = job_name or _job_name(name, mode, attempt)
-    body = job(job_name, name, namespace, spec, mode, config_name, claim_name)
+    body = job(job_name, name, namespace, spec, mode, config_name, uploads_name)
     body["metadata"]["namespace"] = namespace
     kopf.adopt(body)
     try:
