@@ -1,0 +1,90 @@
+# Created by claude-opus-5
+#
+# FhirUploadGrant: cert-manager's shape, applied to signed URLs.
+#
+#   Certificate  -> FhirUploadGrant   the declarative request
+#   CSR + ACME   -> the prefix check  proof the requester owns what it asks for
+#   TLS Secret   -> the grant Secret  what the consumer actually mounts/reads
+#   renewBefore  -> the renew timer   re-mint before the credential expires
+#
+# It exists because the launch-time minting in benchmark.py cannot scale to
+# per-case evidence: two objects per case per shard is thousands of v4 URLs at
+# ~700 bytes each, which does not fit in a Secret, and the paths for a failed
+# repetition are not knowable until it fails. So a worker asks for URLs while
+# it runs, and the operator -- the only holder of the signing credential --
+# decides whether it may have them.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: fhiruploadgrants.perf.fhir
+spec:
+  group: perf.fhir
+  scope: Namespaced
+  names:
+    kind: FhirUploadGrant
+    plural: fhiruploadgrants
+    singular: fhiruploadgrant
+    shortNames: [fug]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - {name: Benchmark, type: string,  jsonPath: .spec.benchmarkRef}
+        - {name: Run,       type: integer, jsonPath: .spec.runId}
+        - {name: Step,      type: integer, jsonPath: .spec.stepIndex}
+        - {name: Shard,     type: integer, jsonPath: .spec.shard}
+        - {name: Secret,    type: string,  jsonPath: .status.secretName}
+        - {name: Minted,    type: integer, jsonPath: .status.minted}
+        - {name: NotAfter,  type: string,  jsonPath: .status.notAfter}
+        - {name: Phase,     type: string,  jsonPath: .status.phase}
+        - {name: Age,       type: date,    jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [benchmarkRef, runId, stepIndex, shard]
+              x-kubernetes-validations:
+                # The prefix check in grants.py is derived from these three.
+                # If a worker could move them it could move the prefix, and
+                # the check would be checking whatever the worker preferred.
+                - rule: "self.benchmarkRef == oldSelf.benchmarkRef"
+                  message: "spec.benchmarkRef is immutable"
+                - rule: "self.runId == oldSelf.runId"
+                  message: "spec.runId is immutable"
+                - rule: "self.stepIndex == oldSelf.stepIndex"
+                  message: "spec.stepIndex is immutable"
+                - rule: "self.shard == oldSelf.shard"
+                  message: "spec.shard is immutable"
+              properties:
+                benchmarkRef:
+                  type: string
+                  minLength: 1
+                runId: {type: integer, minimum: 1}
+                stepIndex: {type: integer, minimum: 0}
+                shard: {type: integer, minimum: 0}
+                ttlSeconds:
+                  type: integer
+                  default: 900
+                  minimum: 120
+                  maximum: 43200
+                paths:
+                  # A rolling window, not an accumulating log. The worker PUTs
+                  # each object within seconds of being handed its URL, so a
+                  # page that has rolled off has already been used.
+                  type: array
+                  default: []
+                  maxItems: 256
+                  items:
+                    type: object
+                    required: [path]
+                    properties:
+                      path: {type: string, minLength: 1}
+                      contentType: {type: string, default: application/json}
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

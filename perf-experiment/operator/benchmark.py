@@ -32,6 +32,7 @@ import catalogue
 import control
 import datasets
 import gcs
+import grants
 import reconciliation
 import stats
 
@@ -46,6 +47,12 @@ WORKER_IMAGE = os.environ.get("WORKER_IMAGE", "ghcr.io/mooperd/fhir-worker:lates
 SERVICE_ACCOUNT = "fhir-benchmark"
 
 TERMINAL = ("Complete", "Failed", "Aborted")
+
+# How long a grant's minted URLs live. Minutes, not the day a shard body gets:
+# these are handed out in bulk while a step runs and used within seconds of
+# being granted, so a short life costs nothing and a long one leaves thousands
+# of live write capabilities lying in a Secret.
+GRANT_TTL_SECONDS = int(os.environ.get("GRANT_TTL_SECONDS", "900"))
 
 # The only hapi.fhir setting whose value the preflight asserts. HAPI serves an
 # identical repeated search from its own Search cache for 60 s by default, so
@@ -358,13 +365,23 @@ def job_name(name, run_id, step_index):
     return "bm-%s-%d-%d" % (name, run_id, step_index)
 
 
-def _worker_rbac(namespace):
+def _worker_rbac(namespace, name, run_id, step_index, shards):
     """Workers patch their FhirBenchmark. Results go to GCS, not the API server.
 
     The configmaps grant this Role used to carry is gone with the ConfigMap
-    transport it existed for: a worker now writes to two signed URLs and needs
-    no write access to the cluster at all.
+    transport it existed for: a worker writes to signed URLs and needs no
+    write access to the cluster at all.
+
+    The two rules for evidence capture are deliberately the narrowest shape
+    that works. A worker may patch its own FhirUploadGrant, and it may read
+    Secrets -- but only the ones named here, which are the grant Secrets for
+    this step's own shards. Namespace-wide secret read would also hand it
+    POSTGRES_PASSWORD, which is mounted into its own pod two functions below.
+    resourceNames can enumerate them because every name is derived from
+    values known at launch.
     """
+    secrets = [grants.secret_name(grants.grant_name(name, run_id, step_index, i))
+               for i in range(shards)]
     return [
         {"apiVersion": "v1", "kind": "ServiceAccount",
          "metadata": {"name": SERVICE_ACCOUNT, "namespace": namespace}},
@@ -372,7 +389,11 @@ def _worker_rbac(namespace):
          "metadata": {"name": SERVICE_ACCOUNT, "namespace": namespace},
          "rules": [
              {"apiGroups": [GROUP], "resources": ["fhirbenchmarks", "fhirbenchmarks/status"],
-              "verbs": ["get", "list", "patch", "update"]}]},
+              "verbs": ["get", "list", "patch", "update"]},
+             {"apiGroups": [GROUP], "resources": ["fhiruploadgrants"],
+              "verbs": ["get", "patch"]},
+             {"apiGroups": [""], "resources": ["secrets"],
+              "resourceNames": secrets, "verbs": ["get"]}]},
         {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
          "metadata": {"name": SERVICE_ACCOUNT, "namespace": namespace},
          "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role",
@@ -415,6 +436,67 @@ def _shard_urls(namespace, name, run_id, step_index, shard):
         "doneUrl": gcs.upload_url(done, content_type="application/json"),
         "shardUri": gcs.uri(body),
         "doneUri": gcs.uri(done),
+    }
+
+
+def _grant(name, namespace, run_id, step_index, shard):
+    """One FhirUploadGrant per shard: the worker's channel for asking.
+
+    Created empty, before the Job, so the Secret the worker reads exists by
+    the time it looks. Everything it will contain is minted on demand by
+    grants.py; nothing about the per-case object names is known here.
+    """
+    return {
+        "apiVersion": "%s/%s" % (GROUP, VERSION),
+        "kind": "FhirUploadGrant",
+        "metadata": {
+            "name": grants.grant_name(name, run_id, step_index, shard),
+            "namespace": namespace,
+            "labels": {"app": "fhir-benchmark", "benchmark": name,
+                       "run": str(run_id), "step": str(step_index)}},
+        "spec": {"benchmarkRef": name, "runId": int(run_id),
+                 "stepIndex": int(step_index), "shard": int(shard),
+                 "ttlSeconds": GRANT_TTL_SECONDS, "paths": []},
+    }
+
+
+def _ensure_grants(name, namespace, run_id, step_index, count):
+    """Create, never apply.
+
+    A server-side apply would reset spec.paths to [] on every call, and launch
+    is reachable again for a step whose Job already exists. Resetting the page
+    a running worker is mid-way through asking for is not worth the tidiness.
+    """
+    resource = _dyn().resources.get(api_version="%s/%s" % (GROUP, VERSION),
+                                    kind="FhirUploadGrant")
+    for shard in range(count):
+        doc = _grant(name, namespace, run_id, step_index, shard)
+        kopf.adopt(doc)
+        try:
+            resource.create(body=doc, namespace=namespace)
+        except client.ApiException as exc:
+            if exc.status != 409:
+                raise
+
+
+def _uploads(name, namespace, run_id, step_index, count):
+    """What the worker needs in order to ask for URLs, and nothing else.
+
+    No URL is in here. casePrefix is a prefix, not a capability: the worker
+    builds object paths under it and the operator checks every one of them
+    against the same prefix before signing anything.
+    """
+    return {
+        "namespace": namespace,
+        "casePrefix": "%s/cases" % gcs.step_prefix(namespace, name, run_id,
+                                                   step_index),
+        "ttlSeconds": GRANT_TTL_SECONDS,
+        "grants": {
+            str(shard): {
+                "grantName": grants.grant_name(name, run_id, step_index, shard),
+                "secretName": grants.secret_name(
+                    grants.grant_name(name, run_id, step_index, shard))}
+            for shard in range(count)},
     }
 
 
@@ -500,11 +582,16 @@ def launch(spec, namespace, name, step, step_index, status, logger):
     count = int(step.get("concurrency", base["concurrency"])) \
         if step["step"] == "measure" else 1
 
-    for doc in _worker_rbac(namespace):
+    for doc in _worker_rbac(namespace, name, run_id, step_index, count):
         _apply(doc, namespace)
     # Same per-namespace Prometheus the loader uses; it keeps pods labelled
     # app=fhir-benchmark as well as app=fhir-loader.
     datasets.ensure_prometheus(namespace, logger)
+
+    # Before the Job, so the Secret a worker reads its granted URLs from is
+    # already there when it starts asking.
+    if step["step"] == "measure":
+        _ensure_grants(name, namespace, run_id, step_index, count)
 
     # One signed URL pair per shard, keyed by completion index; a worker takes
     # its own pair by JOB_COMPLETION_INDEX. The pairs authorise exactly the two
@@ -513,6 +600,8 @@ def launch(spec, namespace, name, step, step_index, status, logger):
     config = _step_config(spec, step, step_index, name, namespace, status)
     config["results"] = {str(i): _shard_urls(namespace, name, run_id, step_index, i)
                          for i in range(count)}
+    if step["step"] == "measure":
+        config["uploads"] = _uploads(name, namespace, run_id, step_index, count)
     doc = _config_secret(config_name, config)
     doc["metadata"]["namespace"] = namespace
     kopf.adopt(doc)
@@ -929,6 +1018,8 @@ def _ingest(spec, namespace, name, step, index, run_id, entry, status, patch,
         entry["invalidReasons"] = sorted(set(r["invalidReason"] for r in invalid
                                              if r.get("invalidReason")))[:10]
 
+    _publish_exchanges(namespace, name, run_id, index, step, published, entry)
+
     merged = None
     if records:
         summary = stats.summarise(records)
@@ -981,6 +1072,40 @@ def _ingest(spec, namespace, name, step, index, run_id, entry, status, patch,
 
     _close(entry, "Passed", status, patch, spec, index,
            namespace, name, run_id, totals=merged)
+
+
+def _publish_exchanges(namespace, name, run_id, index, step, published, entry):
+    """Fold the shards' exchange indexes into one object for the detail view.
+
+    Each worker reports the objects it wrote in its own done marker. Merging
+    them here means opening a case costs two reads -- this object and the
+    exchange itself -- instead of a list_prefix over the whole run, which is
+    O(objects in the run) for a page that wants a handful of them.
+
+    Upload failures are counted into the journal and go no further. A shard
+    body is a measurement and a truncated one voids the step; an exchange is a
+    diagnostic, and losing one is not a reason to void a run that measured
+    everything it was asked to.
+    """
+    cases, failures, uploaded = {}, [], 0
+    for shard in published:
+        for case_id, paths in (shard.get("exchanges") or {}).items():
+            cases.setdefault(case_id, []).extend(paths)
+        failures.extend(shard.get("exchangeFailures") or [])
+        uploaded += int(shard.get("exchangeUploaded") or 0)
+    if not cases:
+        return
+
+    gcs.write_json(gcs.exchanges_path(namespace, name, run_id, index), {
+        "index": index, "id": step["id"], "step": step["step"],
+        "cacheLabel": step.get("cacheLabel") or step["id"],
+        "finishedAt": _now(), "cases": cases})
+
+    entry["exchanges"] = uploaded
+    if failures:
+        entry["exchangeFailures"] = len(failures)
+        entry["exchangeFailureReasons"] = sorted(
+            set(f.get("error", "") for f in failures))[:5]
 
 
 def _fail(spec, namespace, name, status, patch, logger, entry, index, reason):

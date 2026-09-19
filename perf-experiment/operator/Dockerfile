@@ -22,7 +22,7 @@ FROM base AS worker
 COPY requirements-worker.txt /app/requirements-worker.txt
 RUN pip install --no-cache-dir -r /app/requirements-worker.txt
 
-COPY upload.py runner.py loader.py /app/
+COPY upload.py exchange.py runner.py loader.py /app/
 
 ENV HOME=/tmp
 EXPOSE 9100
@@ -38,7 +38,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY fhir_operator.py ui.py datasets.py reconciliation.py loader.py \
      benchmark.py catalogue.py binding.py control.py stats.py runner.py \
-     gcs.py upload.py /app/
+     gcs.py upload.py grants.py exchange.py /app/
 
 # Supplied by CI as ghcr.io/<owner>/fhir-worker@sha256:... -- an immutable
 # reference resolved at build time, never a floating tag at run time.

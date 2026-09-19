@@ -105,12 +105,53 @@ def report_path(namespace, name, run_id):
 
 
 # --------------------------------------------------------------------------
+# Per-case evidence
+#
+# A summary row says a case took 412 ms and returned 20 rows. It cannot say
+# what was asked or what came back, and when a number looks wrong that is the
+# only question worth asking. These paths are where the exchange that produced
+# the number lives.
+#
+# The page is a separate object from the exchange on purpose: an exchange is
+# a few hundred bytes of headers and always worth reading, and a first page
+# can be tens of megabytes. Keeping them apart means the detail view can list
+# and read every exchange in a step without dragging the bodies with it.
+# --------------------------------------------------------------------------
+
+def case_prefix(namespace, name, run_id, step_index, case_id):
+    return "%s/cases/%s" % (step_prefix(namespace, name, run_id, step_index),
+                            case_id)
+
+
+def exchange_path(namespace, name, run_id, step_index, case_id, shard, rep=None):
+    stem = "%d" % shard if rep is None else "%d-r%d" % (shard, rep)
+    return "%s/%s.exchange.json" % (
+        case_prefix(namespace, name, run_id, step_index, case_id), stem)
+
+
+def page_path(namespace, name, run_id, step_index, case_id, shard, rep=None):
+    stem = "%d" % shard if rep is None else "%d-r%d" % (shard, rep)
+    return "%s/%s.page.json" % (
+        case_prefix(namespace, name, run_id, step_index, case_id), stem)
+
+
+def exchanges_path(namespace, name, run_id, step_index):
+    """caseId -> [object paths], written by the operator when a step lands.
+
+    The alternative is list_prefix over the run every time someone opens a
+    case, which is O(objects in the run) for a page that wants O(1) of them.
+    """
+    return "%s/exchanges.json" % step_prefix(namespace, name, run_id, step_index)
+
+
+# --------------------------------------------------------------------------
 # Signed URLs -- the only thing a worker ever receives
 # --------------------------------------------------------------------------
 
-def _signed(path, method, content_type=None, hours=None):
+def _signed(path, method, content_type=None, hours=None, seconds=None):
     creds = credentials()
-    expiry = datetime.timedelta(hours=hours or SIGNED_URL_HOURS)
+    expiry = (datetime.timedelta(seconds=seconds) if seconds
+              else datetime.timedelta(hours=hours or SIGNED_URL_HOURS))
     return bucket().blob(path).generate_signed_url(
         version="v4",
         expiration=expiry,
@@ -120,9 +161,15 @@ def _signed(path, method, content_type=None, hours=None):
         service_account_email=creds.signer_email)
 
 
-def upload_url(path, content_type="application/x-ndjson", hours=None):
-    """A URL a worker may PUT exactly one object to, once, until it expires."""
-    return _signed(path, "PUT", content_type=content_type, hours=hours)
+def upload_url(path, content_type="application/x-ndjson", hours=None,
+               seconds=None):
+    """A URL a worker may PUT exactly one object to, once, until it expires.
+
+    seconds is for grant-minted URLs, which are handed out mid-run in bulk and
+    live in minutes rather than the day a shard body gets.
+    """
+    return _signed(path, "PUT", content_type=content_type, hours=hours,
+                   seconds=seconds)
 
 
 def download_url(path, hours=1):

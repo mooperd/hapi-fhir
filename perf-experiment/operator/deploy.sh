@@ -103,6 +103,7 @@ echo "==> CRDs"
 kubectl apply -f "$HERE/crd.yaml"
 kubectl apply -f "$HERE/dataset-crd.yaml"
 kubectl apply -f "$HERE/benchmark-crd.yaml"
+kubectl apply -f "$HERE/grant-crd.yaml"
 
 echo "==> namespace"
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -

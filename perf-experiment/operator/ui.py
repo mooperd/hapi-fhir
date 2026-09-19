@@ -1362,6 +1362,99 @@ def benchmark_results(namespace, name):
                                % (name, status.get("runId"))})
 
 
+def case_exchanges(namespace, name, run_id, status, case_id):
+    """Every stored exchange for one case, in step order.
+
+    Driven off the journal rather than a bucket listing: only measure steps
+    produce exchanges, and each one publishes an index naming the objects its
+    shards wrote. Two reads per step, none of them proportional to the size of
+    the run.
+    """
+    out, errors = [], []
+    for item in sorted(status.get("journal") or [], key=lambda e: e.get("index", 0)):
+        if item.get("step") != "measure" or item.get("index") is None:
+            continue
+        index = int(item["index"])
+        try:
+            published = gcs.read_json_or_empty(
+                gcs.exchanges_path(namespace, name, run_id, index))
+        except Exception as exc:                  # noqa: BLE001 - shown, not raised
+            errors.append("step %d index: %s: %s" % (index, type(exc).__name__, exc))
+            continue
+        paths = ((published.get("cases") or {}).get(case_id)) or []
+        for path in sorted(p for p in paths if p.endswith(".exchange.json")):
+            try:
+                doc = gcs.read_json(path)
+            except Exception as exc:              # noqa: BLE001 - shown, not raised
+                errors.append("%s: %s: %s" % (path, type(exc).__name__, exc))
+                continue
+            page = doc.get("page") or {}
+            page_url = None
+            # The only signed URL this page mints. A first page can be tens of
+            # megabytes and the browser fetches it from GCS directly rather
+            # than streaming it through the operator.
+            if page.get("object"):
+                try:
+                    page_url = gcs.download_url(page["object"])
+                except Exception as exc:          # noqa: BLE001 - shown, not raised
+                    errors.append("%s: %s: %s" % (page["object"],
+                                                  type(exc).__name__, exc))
+            out.append({
+                "index": index,
+                "stepId": published.get("id") or item.get("id"),
+                "cache": published.get("cacheLabel") or item.get("id"),
+                "shard": doc.get("shard"), "rep": doc.get("rep"),
+                "node": doc.get("node"),
+                "uri": gcs.uri(path),
+                "request": doc.get("request") or {},
+                "response": doc.get("response") or {},
+                "record": doc.get("record") or {},
+                "error": doc.get("error"),
+                "page": page, "pageUrl": page_url,
+                "pageUri": gcs.uri(page["object"]) if page.get("object") else None,
+            })
+    return out, ("; ".join(errors) or None)
+
+
+@app.route("/fhirbenchmarks/<namespace>/<name>/cases/<case_id>")
+def benchmark_case(namespace, name, case_id):
+    """One case: its summary rows, and the exchanges that produced them.
+
+    The summary answers how fast. This answers what was asked and what came
+    back, which is the only question worth having once a number looks wrong.
+    """
+    crd = find(BENCHMARK_PLURAL)
+    if crd is None:
+        return redirect(url_for("index"))
+    try:
+        obj = _custom().get_namespaced_custom_object(
+            GROUP, crd["version"], namespace, BENCHMARK_PLURAL, name)
+    except client.ApiException as exc:
+        return Response("%s %s" % (exc.status, exc.reason), status=exc.status,
+                        mimetype="text/plain")
+
+    status = obj.get("status") or {}
+    run_id = request.args.get("run") or status.get("runId")
+    if not run_id:
+        return Response("no run recorded for %s/%s" % (namespace, name),
+                        status=404, mimetype="text/plain")
+
+    summary, error = {}, None
+    try:
+        summary = gcs.read_summary(namespace, name, int(run_id))
+    except Exception as exc:                      # noqa: BLE001 - shown, not raised
+        error = "results unavailable: %s: %s" % (type(exc).__name__, exc)
+
+    rows = [r for r in summary_rows(summary) if r["case"] == case_id]
+    exchanges, exchange_error = case_exchanges(namespace, name, int(run_id),
+                                               status, case_id)
+    return render_template_string(
+        CASE, crds=crds(), crd=crd, namespace=namespace, name=name,
+        case_id=case_id, run_id=run_id, rows=rows, exchanges=exchanges,
+        fmt=fmt, json=json,
+        error="; ".join(x for x in (error, exchange_error) if x) or None)
+
+
 @app.route("/fhirbenchmarks/<namespace>/<name>/objects")
 def benchmark_objects(namespace, name):
     """Every object a run wrote, each with a short-lived signed read URL.
@@ -2695,7 +2788,9 @@ BENCHMARK = """
     <tbody>
     {% for r in rows %}
       <tr>
-        <td class="font-monospace small">{{ r.case }}</td>
+        <td class="font-monospace small">
+          <a class="text-decoration-none"
+             href="/fhirbenchmarks/{{ namespace }}/{{ name }}/cases/{{ r.case|urlencode }}">{{ r.case }}</a></td>
         <td class="small">{{ r.family }}</td>
         <td class="small">{{ r.cache }}</td>
         <td class="text-end font-monospace small">{{ r.n }}</td>
@@ -2727,6 +2822,193 @@ BENCHMARK = """
 
 </main>
 <script>setTimeout(function () { location.reload(); }, 15000);</script>
+</body></html>
+"""
+
+
+CASE = """
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ case_id }} - case</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head><body class="bg-body-tertiary">
+
+<nav class="navbar navbar-expand bg-dark" data-bs-theme="dark"><div class="container-fluid">
+  <span class="navbar-brand">FHIR operator</span>
+  <ul class="navbar-nav me-auto">
+  {% for c in crds %}
+    <li class="nav-item"><a class="nav-link {{ 'active' if crd and c.plural == crd.plural }}"
+       href="/{{ c.plural }}">{{ c.kind }}</a></li>
+  {% endfor %}
+  </ul>
+</div></nav>
+
+<main class="container-fluid py-4">
+{% if error %}<div class="alert alert-warning"><pre class="mb-0">{{ error }}</pre></div>{% endif %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h5 class="mb-0">
+    <a class="text-decoration-none" href="/fhirbenchmarks">FhirBenchmark</a>
+    <span class="text-body-secondary">/</span>
+    <a class="text-decoration-none font-monospace"
+       href="/fhirbenchmarks/{{ namespace }}/{{ name }}">{{ namespace }}/{{ name }}</a>
+    <span class="text-body-secondary">/</span>
+    <span class="font-monospace">{{ case_id }}</span>
+  </h5>
+  <span class="small text-body-secondary">run {{ run_id }}</span>
+</div>
+
+<div class="card mb-3">
+  <div class="card-header">Measured</div>
+  <div class="table-responsive">
+  <table class="table table-sm table-striped mb-0 align-middle">
+    <thead><tr class="small"><th>Cache</th>
+      <th class="text-end">n</th><th class="text-end">invalid</th>
+      <th class="text-end">p50</th><th class="text-end">p90</th>
+      <th class="text-end">p95</th><th class="text-end">p99</th>
+      <th class="text-end">max</th><th class="text-end">page</th>
+      <th class="text-end">total</th><th>Engine</th><th>Declared</th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td class="small">{{ r.cache }}</td>
+        <td class="text-end font-monospace small">{{ r.n }}</td>
+        <td class="text-end font-monospace small {{ 'text-danger fw-semibold' if r.invalid }}">{{ r.invalid }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.p50) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.p90) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.p95) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.p99) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.max) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.rows) }}</td>
+        <td class="text-end font-monospace small">{{ fmt(r.total) }}</td>
+        <td class="small font-monospace {{ 'text-danger' if r.expected and r.engine != r.expected }}">{{ r.engine }}</td>
+        <td class="small font-monospace text-body-secondary">{{ r.expected or '-' }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="12" class="text-body-secondary">No summary for this case in run {{ run_id }}.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+{% for x in exchanges %}
+<div class="card mb-3">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span>
+      <span class="badge text-bg-secondary">{{ x.cache }}</span>
+      <span class="font-monospace small">step {{ x.index }} &middot; shard {{ x.shard }} &middot; rep {{ x.rep }}</span>
+      {% if x.record and not x.record.valid %}
+        <span class="badge text-bg-danger">invalid</span>
+      {% endif %}
+    </span>
+    <span class="small text-body-secondary font-monospace">{{ x.node }}</span>
+  </div>
+  <div class="card-body">
+
+    <div class="row g-3">
+      <div class="col-lg-6">
+        <div class="small text-body-secondary text-uppercase mb-1">Request</div>
+        <pre class="small bg-body-tertiary p-2 rounded mb-2"><code>{{ x.request.method }} {{ x.request.url }}</code></pre>
+        <table class="table table-sm table-borderless mb-2">
+          <tbody>
+          {% for k, v in (x.request.headers or {})|dictsort %}
+            <tr><td class="small font-monospace text-body-secondary" style="width: 14rem">{{ k }}</td>
+                <td class="small font-monospace">{{ v }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% if x.request.body %}
+          <div class="small text-body-secondary text-uppercase mb-1">Body</div>
+          <pre class="small bg-body-tertiary p-2 rounded mb-0"><code>{{ x.request.body }}</code></pre>
+        {% endif %}
+      </div>
+
+      <div class="col-lg-6">
+        <div class="small text-body-secondary text-uppercase mb-1">Response</div>
+        {% if x.response %}
+          <pre class="small bg-body-tertiary p-2 rounded mb-2"><code>HTTP {{ x.response.status }} {{ x.response.reason }}
+{{ x.response.contentLength }} bytes, {{ fmt(x.response.elapsedMs, 1) }} ms</code></pre>
+          <table class="table table-sm table-borderless mb-0">
+            <tbody>
+            {% for k, v in (x.response.headers or {})|dictsort %}
+              <tr><td class="small font-monospace text-body-secondary" style="width: 14rem">{{ k }}</td>
+                  <td class="small font-monospace">{{ v }}</td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="alert alert-danger small mb-0 font-monospace">{{ x.error or 'no response' }}</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <hr>
+
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <span class="small text-body-secondary text-uppercase">First page</span>
+      <span class="small font-monospace text-body-secondary">
+        {% if x.page and x.page.omitted %}
+          not stored -- {{ x.page.omitted }}
+        {% elif x.pageUrl %}
+          {{ x.page.bytes }} bytes{% if x.page.truncated %},
+          stored truncated at {{ x.page.storedBytes }}{% endif %}
+          &middot; <a href="{{ x.pageUrl }}" rel="noopener">download</a>
+        {% else %}
+          none
+        {% endif %}
+      </span>
+    </div>
+    {% if x.pageUrl %}
+      <details>
+        <summary class="small">Show page</summary>
+        {% if x.page.truncated %}
+          <div class="alert alert-warning small mt-2 mb-2">Truncated to the first
+          {{ x.page.storedBytes }} bytes of {{ x.page.bytes }}, so this is not
+          parseable JSON. Download for what was stored.</div>
+        {% endif %}
+        <pre class="small bg-body-tertiary p-2 rounded mt-2 mb-0"
+             style="max-height: 30rem; overflow: auto"
+             data-page="{{ x.pageUrl }}"><code>loading...</code></pre>
+      </details>
+      <div class="small text-body-secondary font-monospace mt-1">{{ x.pageUri }}</div>
+    {% endif %}
+
+    <details class="mt-3">
+      <summary class="small">Measurement record</summary>
+      <pre class="small bg-body-tertiary p-2 rounded mt-2 mb-0"><code>{{ json.dumps(x.record, indent=2) }}</code></pre>
+    </details>
+    <div class="small text-body-secondary font-monospace mt-2">{{ x.uri }}</div>
+
+  </div>
+</div>
+{% else %}
+<div class="alert alert-secondary">
+  No stored exchanges for this case in run {{ run_id }}. Capture landed in the
+  operator after this run, or the step that ran it was not a measure step.
+</div>
+{% endfor %}
+
+</main>
+<script>
+// Pages are fetched from GCS with the signed URL, on demand. A run holds
+// thousands of them and some are tens of megabytes; loading them with the
+// page would make the page useless.
+document.querySelectorAll('details').forEach(function (d) {
+  d.addEventListener('toggle', function () {
+    var pre = d.querySelector('pre[data-page]');
+    if (!d.open || !pre || pre.dataset.loaded) { return; }
+    pre.dataset.loaded = '1';
+    fetch(pre.dataset.page).then(function (r) { return r.text(); }).then(function (text) {
+      try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { /* truncated */ }
+      pre.querySelector('code').textContent = text;
+    }).catch(function (e) {
+      pre.querySelector('code').textContent = 'could not fetch page: ' + e;
+    });
+  });
+});
+</script>
 </body></html>
 """
 

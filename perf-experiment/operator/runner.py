@@ -40,6 +40,7 @@ import psycopg
 import requests
 from prometheus_client import Histogram, start_http_server
 
+import exchange
 import upload
 
 CONFIG_PATH = os.environ.get("BENCHMARK_CONFIG", "/config/benchmark.json")
@@ -297,20 +298,32 @@ def render(text, bindings):
 
 
 def issue(session, method, path, query, timeout):
-    """One request. Returns (wallMs, response|None, exception|None)."""
+    """One request. Returns (wallMs, response|None, exception|None, sent).
+
+    sent is what went on the wire, for the evidence capture. It is taken from
+    response.request where there is a response, because that is the request
+    after the Session merged in its own defaults -- the headers this function
+    assembled are only what it asked for.
+    """
     url = BASE_URL.rstrip("/") + path
     headers = {"Accept": "application/fhir+json", "Cache-Control": "no-cache"}
+    sent = {"method": method, "url": url, "headers": dict(headers), "body": None}
     begin = time.perf_counter()
     try:
         if method == "POST":
             headers["Content-Type"] = "application/x-www-form-urlencoded"
+            sent["headers"] = dict(headers)
+            sent["body"] = query
             response = session.post(url, data=query, headers=headers, timeout=timeout)
         else:
-            response = session.get(url + (("?" + query) if query else ""),
-                                   headers=headers, timeout=timeout)
-        return (time.perf_counter() - begin) * 1000.0, response, None
+            sent["url"] = url + (("?" + query) if query else "")
+            response = session.get(sent["url"], headers=headers, timeout=timeout)
+        if response.request is not None:
+            sent["headers"] = dict(response.request.headers)
+            sent["url"] = response.request.url
+        return (time.perf_counter() - begin) * 1000.0, response, None, sent
     except Exception as exc:                  # noqa: BLE001 - recorded, never swallowed
-        return (time.perf_counter() - begin) * 1000.0, None, exc
+        return (time.perf_counter() - begin) * 1000.0, None, exc, sent
 
 
 def issue_codes(payload):
@@ -335,7 +348,7 @@ def read_bundle(response):
     return None, None, []
 
 
-def step_measure(config, conn, records):
+def step_measure(config, conn, records, uploads):
     """Every case in this shard, repeated, with its PostgreSQL evidence."""
     cases = config["cases"]
     mine = cases[INDEX::PARALLELISM]
@@ -354,6 +367,7 @@ def step_measure(config, conn, records):
             "be attributed to an engine. PostgreSQL activity alone cannot tell the "
             "two apart: both engines leave PostgreSQL traces. Set ES_BASE_URL and "
             "make the service reachable from the worker" % (ES_BASE_URL or "<unset>"))
+    uploads.prime(mine)
     print("worker %d: %d of %d cases, %d repeats after %d warmup, attribution %s"
           % (INDEX, len(mine), len(cases), repeats, warmup,
              "on" if attributable else "off (concurrency > 1)"), flush=True)
@@ -367,7 +381,7 @@ def step_measure(config, conn, records):
             method = case["method"]
             path = render(case["path"], bindings)
             query = render(case["query"], bindings)
-            wall, response, exc = issue(session, method, path, query, timeout)
+            wall, response, exc, sent = issue(session, method, path, query, timeout)
 
             if rep < warmup:
                 continue
@@ -402,6 +416,7 @@ def step_measure(config, conn, records):
                     record["valid"] = True
             rendered.append(record)
             records.append(record)
+            uploads.record(case, record, sent, response, exc)
             LATENCY.labels(case=case["id"], family=case["family"], cache=cache_label,
                            engine=case.get("expectEngine") or "unknown",
                            stack=STACK).observe(wall / 1000.0)
@@ -414,6 +429,10 @@ def step_measure(config, conn, records):
                     if attributable else None)
         _reconcile(case, rendered, delta, observed, attributable, tolerance_pct,
                    es_delta)
+        # After reconciliation, never before: a repetition that looked valid
+        # inside the loop can be invalidated here, and the exchange has to
+        # carry the verdict that was actually reached.
+        uploads.flush_case()
         done = sum(1 for r in rendered if r["valid"])
         print("worker %d: %s %d/%d valid, engine=%s, readRatio=%s"
               % (INDEX, case["id"], done, len(rendered), observed or "-",
@@ -563,13 +582,17 @@ def main():
 
     records = []
     extra = {}
+    # Started before the server wait so the grant round trip and the first
+    # mint are already behind us by the time the first case is measured.
+    uploads = (exchange.Uploads(config, RESULTS_DIR, INDEX, NODE_NAME)
+               if step_type == "measure" else None)
     try:
         with connect() as conn:
             if step_type == "measure":
                 session = requests.Session()
                 if not wait_for_server(session):
                     return 1
-                extra, code = step_measure(config, conn, records)
+                extra, code = step_measure(config, conn, records, uploads)
             elif step_type in STEPS:
                 if INDEX != 0:
                     print("worker %d: %s is single-worker" % (INDEX, step_type), flush=True)
@@ -581,7 +604,17 @@ def main():
         print(traceback.format_exc(), flush=True)
         return fail("%s raised %s: %s" % (step_type, type(exc).__name__, exc))
 
+    # step_measure returns None for extra when it refuses to start. Guarded
+    # here because the drain below and the marker both read it.
+    extra = extra or {}
     extra["outcome"] = "Passed" if code == 0 else "Failed"
+
+    # Drained before the shard body and the marker, so that by the time the
+    # marker exists every object it names exists too. The marker is what the
+    # operator trusts; nothing may be written after it.
+    if uploads is not None:
+        extra.update(uploads.close())
+
     write_shard(config, records, extra)
 
     invalid = sum(1 for r in records if not r["valid"])

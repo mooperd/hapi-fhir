@@ -25,6 +25,7 @@ from kubernetes import client, config, dynamic
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import benchmark  # noqa: E402 - needs the path above
 import datasets  # noqa: E402 - needs the path above
+import grants  # noqa: E402 - needs the path above
 import reconciliation  # noqa: E402 - needs the path above
 import ui  # noqa: E402 - needs the path above
 
@@ -336,6 +337,7 @@ def startup(settings, logger, **_):
     # ConfigMap, one pip install and one set of credentials.
     datasets.init(dyn)
     reconciliation.init(dyn)
+    grants.init(dyn)
     benchmark.init(dyn)
     ui.start(UI_PORT, dyn)
     logger.info("UI listening on :%d", UI_PORT)
